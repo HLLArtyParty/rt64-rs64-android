@@ -179,6 +179,14 @@ namespace RT64 {
         rspSmoothNormalVector.clear();
         frameParams.viewUbershaders = ubershadersVisible;
         frameParams.ditherNoiseStrength = ditherNoiseStrength;
+        // Diagnostic (ROGUESQ_DESC_DIAG): per-frame framebuffer-pair count. The cinematic's
+        // CIMG churn inflates this; framebufferVector grows to its high-water (2 descriptor
+        // sets each), which is the real CBV view-heap leak driver.
+        {
+            static int s_fc = -1;
+            if (s_fc < 0) { const char *e = std::getenv("ROGUESQ_DESC_DIAG"); s_fc = (e && e[0] && e[0] != '0') ? 0 : -2; }
+            if (s_fc >= 0) { static uint32_t s_max = 0; if (framebufferCount > s_max) { s_max = framebufferCount; fprintf(stderr, "[fbpair] frame fbPairCount=%u (new max) vecSize=%zu\n", framebufferCount, framebufferVector.size()); fflush(stderr); } }
+        }
         framebufferCount = 0;
 
         // Create dummy color target if it hasn't been created yet.
@@ -315,9 +323,27 @@ namespace RT64 {
         assert(worker != nullptr);
         assert(drawBuffers != nullptr);
         
+        // Size the boundless texture descriptor set at a stable ceiling (the shader's
+        // UpperRange=8192) and build it ONCE, rather than rebuilding it ever-larger each
+        // time textureCacheSize grows. RS64's cinematic churns many tile-copies/dynamic
+        // views per frame (getDestinationIndex bumps textureCacheSize), so the old
+        // ((textureCacheSize+1)*3)/2 path rebuilt the set constantly; because make_unique
+        // allocates the new (larger) set before the old one is freed, each rebuild stranded
+        // the old block at a higher CBV_SRV_UAV heap offset → the 64K view heap climbed to
+        // exhaustion and getCPUHandleAt asserted (the cinematic descriptor-heap crash).
+        // A fixed-capacity set is created once and reused (setTexture updates entries in
+        // place). Opt out to the legacy growth with ROGUESQ_FBTEX_FIXED_CAP=0.
+        static int s_fixed_cap = -1;
+        if (s_fixed_cap < 0) { const char *e = std::getenv("ROGUESQ_FBTEX_FIXED_CAP"); s_fixed_cap = (e && e[0] == '0') ? 0 : 1; }
         const bool createSet = (descTextureSet == nullptr) || (descTextureSet->textureCacheSize < (textureCacheSize + 1));
         if (createSet) {
-            descTextureSet = std::make_unique<FramebufferRendererDescriptorTextureSet>(worker->device, ((textureCacheSize + 1) * 3) / 2);
+            const uint32_t legacyCap = ((textureCacheSize + 1) * 3) / 2;
+            const uint32_t fixedCap = (textureCacheSize + 1) > (uint32_t)FramebufferRendererDescriptorTextureSet::UpperRange
+                ? legacyCap : (uint32_t)FramebufferRendererDescriptorTextureSet::UpperRange;
+            static int s_dd = -1;
+            if (s_dd < 0) { const char *e = std::getenv("ROGUESQ_DESC_DIAG"); s_dd = (e && e[0] && e[0] != '0') ? 0 : -2; }
+            if (s_dd >= 0 && s_dd < 200) { ++s_dd; fprintf(stderr, "[desc-texset] rebuild textureCacheSize=%u cap=%u\n", textureCacheSize, s_fixed_cap ? fixedCap : legacyCap); fflush(stderr); }
+            descTextureSet = std::make_unique<FramebufferRendererDescriptorTextureSet>(worker->device, s_fixed_cap ? fixedCap : legacyCap);
         }
 
         if (createSet || (descriptorTextureReplacementMapEnabled != textureCacheReplacementMapEnabled)) {

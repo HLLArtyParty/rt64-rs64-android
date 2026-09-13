@@ -67,6 +67,7 @@ namespace RT64 {
         };
 
         uint8_t *RDRAM;
+        uint8_t *writeBackRDRAM = nullptr;   // RogueSquadron64Recomp: real RDRAM for framebuffer write-back while RDRAM points at a parse snapshot
         uint32_t *MI_INTR_REG;
         void (*checkInterrupts)();
         Microcode microcode;

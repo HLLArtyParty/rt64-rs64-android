@@ -13,6 +13,11 @@
 
 #include "rt64_workload_queue.h"
 
+// Most draw-active color buffer, published by the F3DFACTOR5 GBI module. Present
+// mode 4 presents it so offscreen-rendered content (e.g. the cinematic explosion
+// in 0x290000) reaches the screen.
+extern "C" volatile unsigned g_most_drawn_fb;
+
 namespace RT64 {
     // PresentQueue
 
@@ -220,10 +225,64 @@ namespace RT64 {
                     !ext.sharedResources->colorImageAddressVector.empty())
                 {
                     const auto &vec = ext.sharedResources->colorImageAddressVector;
+                    // Mode 3 (RS64 explosion): present the BUSIEST color buffer — the
+                    // one with the largest recently-written area. The cinematic renders
+                    // content (fire+debris) into an offscreen buffer (e.g. 0x290000) and
+                    // composites to the display buffer via a CPU/RSP copy RT64 can't see,
+                    // so VI's buffer is empty/black while the offscreen one has the frame.
+                    // Picking the busiest buffer presents the actual content.
+                    // Mode 4 (RS64 explosion, recommended): present the buffer the GBI
+                    // module reports as most draw-active (g_most_drawn_fb) — phase-
+                    // adaptive, presents whatever the game is actively rendering into.
+                    if (s_follow_mode == 4) {
+                        uint32_t mfb = (uint32_t)g_most_drawn_fb & 0x00FFFFFFu;
+                        if (mfb >= 0x100000u && mfb != viAddr) {
+                            Framebuffer *fb = fbManager.find(mfb);
+                            if (fb == nullptr) fb = fbManager.find(0x80000000u | mfb);
+                            if (fb != nullptr) {
+                                viFb = fb;
+                                overrideUsed = true;
+                                static std::atomic<uint64_t> ovr4{0};
+                                uint64_t v = ++ovr4;
+                                if (v <= 8 || (v % 60) == 0) {
+                                    std::fprintf(stderr,
+                                        "[vi-follow-draw mode=4] #%llu viAddr=0x%08X -> most-active=0x%08X\n",
+                                        (unsigned long long)v, viAddr, mfb);
+                                    std::fflush(stderr);
+                                }
+                            }
+                        }
+                    }
+                    if (s_follow_mode == 3) {
+                        Framebuffer *best = nullptr;
+                        uint64_t bestArea = 0;
+                        for (uint32_t a : vec) {
+                            Framebuffer *fb = fbManager.find(a);
+                            if (fb == nullptr) continue;
+                            const FixedRect &r = fb->lastWriteRect;
+                            uint64_t area = (uint64_t)r.width(false, true) * (uint64_t)r.height(false, true);
+                            if (area > bestArea) { bestArea = area; best = fb; }
+                        }
+                        if (best != nullptr && bestArea > 0) {
+                            viFb = best;
+                            overrideUsed = true;
+                            static std::atomic<uint64_t> ovr3{0};
+                            uint64_t v = ++ovr3;
+                            if (v <= 8 || (v % 60) == 0) {
+                                std::fprintf(stderr,
+                                    "[vi-follow-draw mode=3] #%llu viAddr=0x%08X -> busiest=0x%08X area=%llu (setSize=%zu)\n",
+                                    (unsigned long long)v, viAddr, best->addressStart,
+                                    (unsigned long long)bestArea, vec.size());
+                                std::fflush(stderr);
+                            }
+                        }
+                    }
                     bool doOverride = false;
-                    if (s_follow_mode == 2) {
+                    if (overrideUsed) {
+                        doOverride = false;  // mode 3 already chose the busiest buffer
+                    } else if (s_follow_mode == 2) {
                         doOverride = true;
-                    } else {
+                    } else if (s_follow_mode == 1) {
                         // Mode 1: override only when VI's fb is stale.
                         bool viInRecent = false;
                         for (uint32_t a : vec) {

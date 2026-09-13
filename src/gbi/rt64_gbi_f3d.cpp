@@ -111,8 +111,16 @@ namespace RT64 {
             uint8_t type = (*dl)->p0(0, 8);
             switch (type) {
             case G_MW_MATRIX:
-                assert(false);
-                // TODO
+                // Unimplemented (perspective-correction matrix-word patch). The F5 cinematic emits
+                // this once the op_07 chunk-branch desync fix lets the walker follow the real DL;
+                // abort here killed the run. No-op it (one-shot warning) so rendering proceeds —
+                // the F5 geometry uses its own matrix path. ROGUESQ_STRICT_READBACK=1 keeps the assert.
+                {
+                    static int s_strict = -1;
+                    if (s_strict < 0) { const char *e = std::getenv("ROGUESQ_STRICT_READBACK"); s_strict = (e && e[0] && e[0] != '0') ? 1 : 0; }
+                    if (s_strict) { assert(false); }
+                    else { static int s_w = 0; if (s_w < 2) { ++s_w; std::fprintf(stderr, "[moveWord] G_MW_MATRIX unimplemented — no-op (non-fatal)\n"); std::fflush(stderr); } }
+                }
                 break;
             case G_MW_NUMLIGHT:
                 state->rsp->setLightCount((((*dl)->w1 - 0x80000000) >> 5) - 1);

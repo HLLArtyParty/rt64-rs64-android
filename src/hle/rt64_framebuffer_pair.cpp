@@ -83,6 +83,18 @@ namespace RT64 {
 
                 const GameCall &call = proj.gameCalls[0];
                 if (proj.type == Projection::Type::Rectangle) {
+                    // ROGUE-SQUADRON-RECOMP fix (2026-05-20): Factor 5
+                    // cinematic emits draws against garbage-CIMG framebuffers
+                    // that the upstream gate at rt64_state.cpp:1464 blocks
+                    // from RDRAM writeback. Those FbPairs still get queued
+                    // for the render thread, but their projection's scissor
+                    // or call rect is uninitialized. fullyInside() asserts
+                    // !isNull(), so the render thread aborts. Skip such
+                    // projections quietly — they're not present-eligible
+                    // candidates anyway.
+                    if (call.callDesc.scissorRect.isNull() || call.callDesc.rect.isNull()) {
+                        continue;
+                    }
                     // The rect call covers the entire dimensions of the scissor.
                     bool fullScreenRect = call.callDesc.scissorRect.fullyInside(call.callDesc.rect);
 

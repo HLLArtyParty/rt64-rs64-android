@@ -4,22 +4,33 @@
 // HLE GBI module for Factor 5's custom RSP microcode (Rogue Squadron 64,
 // Battle for Naboo, Indiana Jones and the Infernal Machine).
 //
-// Inherits the F3DEX dispatch table and overrides only the opcodes Factor 5
-// reuses for its own purposes. The module exists in RT64 (rather than as a
-// game-side patch) for the same reason the other gbi_*.cpp variants do —
-// each ucode family lives in one place so RT64 owns the "what does opcode
-// 0xB5 mean for ucode X" decision.
+// Inherits the F3DEX dispatch table and overrides the opcodes Factor 5 reuses.
+// Rebuilt 2026-09-07 from the hardware goldens (Project64 RDRAM dumps of
+// cinematic frames 78/79/120, byte-identical to the recomp's chunk pool) and
+// docs/f5-model-dl-spec.md after the previous working copy was lost.
 //
-// Recovered + cleaned from MikeSemicolonD/rt64@bbf45b7 (2026-05-03), which
-// bundled this with extensive runtime diagnostics. Diagnostic-only code
-// (RDRAM/DL history capture for offline RE) lives separately and is not
-// required for runtime correctness.
+// Stream facts this file relies on (all measured on the goldens):
+//  - DL chunks are 0x108 bytes: 8-byte header (op 0x80: next/prev pointers) +
+//    0x100 payload. The ucode never executes a header (0x80 dispatches to IMEM 0),
+//    so a header reached by walking linearly means the sub-DL ran off its chunk.
+//  - B5(0) ends a list (a full chunk has it in the last slot; the bytes after a mid-chunk
+//    B5(0) are stale). ROGUESQ_OP_B5_ENDDL=0 restores the last-slot-only rule.
+//  - 0x05: `05 05 .. ..` = 40-byte sprite record, `05 00 .. ..` = 8-byte command.
+//  - 0xBD / 0xBE: 16-byte state commands (payload FFxxxxxx ........).
+//  - 0x03: 24-byte inline lookat/light block (`03 82 ...`), viewport form is 8 bytes.
+//  - 0x01: matrix load, byte1 0x03 = projection (0x8071....), 0x02 = modelview.
+//  - 0x04 / 0x14: vertex batch, n = (w0>>10)&0x3F, 8-byte verts (x,y,z int16, pad).
+//  - 0x02: per-vertex RGBA buffer (4 bytes per vertex, index = vertex index).
+//  - 0xBF: triangle; w1 bytes = indices*5; `w0&2` = 32-byte textured form (indices*5,
+//    indices*4, flags, 3 texcoords 8.8 texels, pad). 0xB4: quad, same 32-byte layout.
 //
 
 #include "rt64_gbi_f3dfactor5.h"
+#include "rt64_gbi_f3dfactor5_internal.h"
 
 #include "hle/rt64_state.h"
 #include "hle/rt64_rdp.h"
+#include "hle/rt64_rsp.h"
 
 #include "rt64_gbi_f3dex.h"
 #include "rt64_gbi_f3d.h"
@@ -29,1175 +40,701 @@
 
 #include <cstdio>
 #include <cstdlib>
-#include <unordered_map>
-#include <unordered_set>
+#include <cstring>
+#include <vector>
+#include <utility>
+
+extern "C" volatile unsigned g_most_drawn_fb = 0;
+extern "C" volatile unsigned g_f5_task_hops = 0;    // previous task's chunk transitions (diagnostic)
+extern "C" volatile unsigned g_f5_task_faces = 0;   // previous task's emitted faces
+extern "C" volatile int g_explosion_hold = 0;
 
 namespace RT64 {
     namespace GBI_F3DFACTOR5 {
-        // ROGUESQ_LOG_GBI=1 enables per-handler diagnostic logs (off by default
-        // because they lock up the ImGui inspector at thousands of lines/sec).
-        static bool gbi_log_enabled() {
-            static bool s_enabled = []() {
-                const char* v = std::getenv("ROGUESQ_LOG_GBI");
-                return v && v[0] && v[0] != '0';
-            }();
-            return s_enabled;
+        // ---------------------------------------------------------------- gates
+        static bool env_on(const char* name, bool def) {
+            const char* v = std::getenv(name);
+            if (!v || !v[0]) return def;
+            return v[0] != '0';
         }
 
-        // ROGUESQ_HLE_FORCE_VISIBLE=1 — override fillColor/combiner/primColor
-        // to known-rendering magenta values to test GPU output independently
-        // of game state.
-        static bool force_visible_enabled() {
-            static bool s = []() {
-                const char* v = std::getenv("ROGUESQ_HLE_FORCE_VISIBLE");
-                return v && v[0] && v[0] != '0';
-            }();
+        // ROGUESQ_LOG_GBI=1 enables per-handler diagnostic logs.
+        bool gbi_log_enabled() {
+            static bool s = env_on("ROGUESQ_LOG_GBI", false);
             return s;
         }
 
-        // G_CC_PRIMITIVE mux: c0/c1 = (0,0,0,PRIM), a0/a1 = (0,0,0,PRIM).
-        static constexpr uint32_t FORCED_COMB_W0 = 0x00FFFEE7u;
-        static constexpr uint32_t FORCED_COMB_W1 = 0x771F77F8u;
+        // ROGUESQ_HLE_FORCE_VISIBLE=1: magenta fill/combiner to test GPU output.
+        bool force_visible_enabled() {
+            static bool s = env_on("ROGUESQ_HLE_FORCE_VISIBLE", false);
+            return s;
+        }
 
-        // Force magenta-opaque fillColor (RGBA5551 0xF80F packed twice).
-        void setFillColor_overridden(State *state, DisplayList **dl) {
-            if (force_visible_enabled()) {
-                state->rdp->setFillColor(0xF80FF80F);
+        // ROGUESQ_F5_NATIVE=0 turns the geometry emission off (parse-only).
+        static bool f5_native_active() {
+            static bool s = env_on("ROGUESQ_F5_NATIVE", true);
+            return s;
+        }
+
+        // Kept for the sibling modules' declarations (the software MVP composer is gone).
+        bool f5_compose_mvp(const uint8_t*, float Mout[12]) {
+            for (int i = 0; i < 12; ++i) Mout[i] = 0.0f;
+            return false;
+        }
+
+        // op_02's per-vertex RGBA buffer (declared in the internal header).
+        thread_local uint32_t s_last_op02_colorbuf = 0, s_last_op02_colorcnt = 0;
+
+        // Shared with rt64_gbi_f5_rdpstate.cpp (declared in the internal header).
+        int s_ci4_tlut_recent = 0;
+        int s_ci4_last_block_words = 0;
+        uint32_t s_last_tlut_src = 0;
+        int s_attrib_glyphs_frame = 0;
+        int s_attrib_fills_frame = 0;
+        int s_attrib_frame_idx = 0;
+        int s_attrib_prev_glyphs = 0;
+        thread_local int s_cart_pass = 0;
+
+        // ------------------------------------------------------------ helpers
+        static inline uint32_t f5_dl_off(State* state, const DisplayList* dl) {
+            return (uint32_t)(reinterpret_cast<const uint8_t*>(dl) - state->fromRDRAM(0));
+        }
+
+        static inline bool f5_is_byte_ramp(uint32_t w) {
+            const uint32_t b0 = (w >> 24) & 0xFF, b1 = (w >> 16) & 0xFF, b2 = (w >> 8) & 0xFF, b3 = w & 0xFF;
+            return b1 == b0 + 1 && b2 == b0 + 2 && b3 == b0 + 3;
+        }
+
+        void op_noop(State*, DisplayList**) {}
+
+        // Skip the 8-byte payload of a 16-byte command.
+        void op_consume16(State*, DisplayList** dl) { (*dl)++; }
+        // Skip the 24-byte payload of a 32-byte command.
+        void op_consume32(State*, DisplayList** dl) { (*dl) += 3; }
+
+        // ------------------------------------------------ chunk flow (from the ucode, IMEM 0x1088..0x12F8)
+        // The RSP fetches one 0x108-byte chunk at a time into DMEM 0x170 and starts executing at +8
+        // (the first 8 bytes are the chunk header: next-chunk pointer, prev pointer). When the cursor
+        // reaches +0x108, or on op B5/0x12, it fetches the chunk named by the header's first word and
+        // continues at +8. 06 pushes {chunk, cursor} and fetches w1; 07 fetches w1 without pushing;
+        // B8 pops (or ends the task when the stack is empty). B5's own w1 is never read.
+        static GBIFunction s_inner[UCODE_MAP_SIZE];
+        static constexpr int F5_MAX_DEPTH = 64;
+        static uint32_t s_task_faces = 0;
+        static void f5_ensure_viewport(State* state);
+        // Above the N64's 8 MB (the recomp heap does use 0x71E000; hardware never sees this range; RT64's
+        // segmented mask allows 16 MB and the host buffer is 512 MB).
+        static constexpr uint32_t F5_VTX_SCRATCH = 0x00A00000u;   // 256 x 16 bytes
+        static constexpr uint32_t F5_VP_SCRATCH  = 0x00A01000u;
+        static constexpr uint32_t F5_FACE_SLOT   = 200;           // temp slots for per-face UVs
+
+        struct F5Vp { int16_t vscale[4]; int16_t vtrans[4]; };   // RT64 reads halfword-swapped words
+        static uint32_t s_chunk_base[F5_MAX_DEPTH];   // RDRAM offset of the chunk each level executes
+        static uint64_t s_chunk_counter = ~0ull;
+        static inline uint32_t f5_depth(State* state) { return (uint32_t)state->returnAddressStack.size(); }
+
+        static inline uint32_t f5_rd32(State* state, uint32_t off) {
+            const uint8_t* ram = state->RDRAM;
+            return ((uint32_t)ram[off ^ 3] << 24) | ((uint32_t)ram[(off + 1) ^ 3] << 16) | ((uint32_t)ram[(off + 2) ^ 3] << 8) | ram[(off + 3) ^ 3];
+        }
+
+        // Fetch `chunk` at this level: execution continues at chunk + 8.
+        static constexpr int F5_CHAIN_MAX = 256;
+        static uint32_t s_chain[F5_MAX_DEPTH][F5_CHAIN_MAX];
+        static uint32_t s_chain_len[F5_MAX_DEPTH];
+        static uint32_t s_task_entries = 0;   // calls + branches + next-links this task (hw: a few hundred)
+        // Ring of the last chunk transitions this task (printed at a budget trip; compare with the offline walk).
+        struct F5Hop { uint32_t from, to, w0, w1; uint8_t depth; };
+        static F5Hop s_hops[4096]; static uint32_t s_hop_n = 0;
+        static void f5_enter_chunk(State* state, DisplayList** dl, uint32_t chunk) {
+            ++s_task_entries;
+            const uint32_t d = f5_depth(state);
+            { F5Hop& h = s_hops[s_hop_n++ & 4095]; h.from = (d < (uint32_t)F5_MAX_DEPTH) ? s_chunk_base[d] : 0; h.to = chunk; h.depth = (uint8_t)d;
+              h.w0 = f5_rd32(state, chunk + 8); h.w1 = f5_rd32(state, chunk + 12); }
+            if (d < (uint32_t)F5_MAX_DEPTH) { s_chunk_base[d] = chunk; s_chain_len[d] = 0; }
+            *dl = reinterpret_cast<DisplayList*>(state->fromRDRAM(chunk + 8)) - 1;
+        }
+
+        // Continue in the chunk named by the current chunk's header (B5 / end of chunk).
+        static uint32_t s_chunk_hops = 0;   // per task; a cycle through recycled chunks would never end
+        // A next-link chain revisiting one of its own chunks is a cycle through recycled memory.
+        static inline bool f5_chunk_revisit(uint32_t depth, uint32_t chunk) {
+            if (depth >= (uint32_t)F5_MAX_DEPTH) return false;
+            uint32_t& n = s_chain_len[depth];
+            for (uint32_t i = 0; i < n; ++i) if (s_chain[depth][i] == chunk) return true;
+            if (n < (uint32_t)F5_CHAIN_MAX) s_chain[depth][n++] = chunk;
+            return false;
+        }
+        static void f5_next_chunk(State* state, DisplayList** dl) {
+            const uint32_t d = f5_depth(state);
+            const uint32_t base = (d < (uint32_t)F5_MAX_DEPTH) ? s_chunk_base[d] : 0;
+            const uint32_t next = base ? f5_rd32(state, base) : 0;
+            const uint32_t target = next & 0x00FFFFFFu;
+            // The allocated chunk list is doubly linked: the next chunk's prev word must point back here.
+            // A stale call into a recycled chunk otherwise walks the whole free list (thousands of garbage faces).
+            const bool linked = (next >> 24) == 0x80u && target != 0 && target + 0x108u <= RDRAMSize && f5_rd32(state, target + 4) == (0x80000000u | base);
+            // Legitimate next-chains are short (hw goldens: <= 19 chunks per sub-list level; root uses 07 links);
+            // a stale call into a recycled chunk would otherwise walk the (also doubly linked) free list.
+            static const uint32_t s_chain_cap = [](){ const char* e = std::getenv("ROGUESQ_F5_CHAIN_CAP"); return (e && *e) ? (uint32_t)std::atoi(e) : 64u; }();
+            const bool tooLong = d < (uint32_t)F5_MAX_DEPTH && s_chain_len[d] >= s_chain_cap;
+            if (!linked || tooLong || target == base || ++s_chunk_hops > 4096u || f5_chunk_revisit(d, target)) {
+                static int s_n = 0;
+                if (gbi_log_enabled() && ++s_n <= 8) {
+                    std::fprintf(stderr, "[gbi-f5] chunk %06X has no next (%08X); ending list\n", base, next);
+                    std::fflush(stderr);
+                }
+                GBI_F3D::endDl(state, dl);
                 return;
             }
-            GBI_RDP::setFillColor(state, dl);
-        }
-    }
-}
-
-namespace RT64 {
-    namespace GBI_F3DFACTOR5 {
-
-        // op 0x80: Factor 5 chunk header (metadata, not control flow).
-        // Payload: w0=next_chunk_addr, w1=prev_chunk_addr (back-pointer).
-        // Chunks are 0x108-byte blocks packed contiguously; the parent DL
-        // walks the chain via standard G_DL (op 0x06). Header is a no-op
-        // for HLE.
-        //
-        // CAUTION: tried calling state->fullSync() here as a batch flush —
-        // crashed with "vector subscript out of range" after 3 invocations.
-        // fullSync from inside a mid-DL handler is unsafe because the
-        // workload-cursor advance leaves indexed structures in a transitional
-        // state. Don't reintroduce without auditing the workload-indexed call
-        // paths first.
-        void op_noop(State *state, DisplayList **dl) {
-            // no-op
+            const uint32_t keep = (d < (uint32_t)F5_MAX_DEPTH) ? s_chain_len[d] : 0;
+            f5_enter_chunk(state, dl, target);
+            if (d < (uint32_t)F5_MAX_DEPTH) s_chain_len[d] = keep;   // a next-link continues the chain
         }
 
-        // op 0xB5: Factor 5 chunk/DL terminator. Each 0x108-byte chunk ends
-        // with op 0xB5; treating as no-op + relying on op 0xB8 (standard F3D
-        // G_ENDDL) for real return is what unblocked text rendering in the
-        // 2026-05-03 fork. RDRAM-bounds exit in the interpreter loop catches
-        // chunk runaways.
-
-        // op 0x01/0x02/0x03 experimental HLE handlers
-        // (ROGUESQ_HLE_OP02_EXPERIMENTAL=1).
-        //
-        // Decoded from F3DFACTOR5 RSP ucode (see
-        // project_attribution_op02_breakthrough_2026_05_13.md):
-        //   - op 0x01: payload (w0_low=count_or_size, w1=ram_src_addr).
-        //              Likely "DMA from RAM into a DMEM scratch buffer."
-        //   - op 0x03: payload constant 0x03800000 / 0x00000000. Likely
-        //              "select fixed-DMEM matrix index + setup register state."
-        //   - op 0x02: payload constant 0x028001C0 / 0x01FF0000. Loops over
-        //              vertex pairs, calls matrix×vec multiply (func_4001F14)
-        //              + perspective divide (func_4001F60), writes 16-byte
-        //              RDP triangle commands to the RDP output buffer.
-        //
-        // The experimental handler is a first-cut implementation that:
-        //   (a) Saves op 0x01's referenced RAM address for later inspection
-        //   (b) When op 0x02 fires, logs the saved state + DMEM-equivalent
-        //       data the original RSP would consume
-        //   (c) Emits a debug-visible fillRect covering the attribution-text
-        //       region with primitive color, proving the dispatch path is now
-        //       producing visible output. NOT a correct text render yet —
-        //       the actual matrix-vertex math + glyph-triangle emission is
-        //       follow-up work.
-        //   (d) Sets a flag picked up by fillRect_logged to optionally skip
-        //       the subsequent black-clear so the debug output isn't wiped.
-        static bool op02_experimental_enabled() {
-            static bool s = []() {
-                const char* v = std::getenv("ROGUESQ_HLE_OP02_EXPERIMENTAL");
-                return v && v[0] && v[0] != '0';
-            }();
-            return s;
+        // The task's first command is the root chunk header itself (RT64 starts AT data_ptr).
+        void op_80_header(State* state, DisplayList** dl) {
+            const uint32_t d = f5_depth(state);
+            if (d < (uint32_t)F5_MAX_DEPTH) s_chunk_base[d] = f5_dl_off(state, *dl);
         }
 
-        // Cross-handler state (per-DL-submission lifetime). Reset by
-        // op 0x80 (chunk header) or first occurrence inside a DL.
-        static thread_local uint32_t s_op01_last_ram = 0;
-        static thread_local uint32_t s_op01_last_w0 = 0;
-        static thread_local uint32_t s_op03_last_w0 = 0;
-        static thread_local int s_op02_count_this_dl = 0;
-        static thread_local bool s_op02_fired_recently = false;
-
-        void op_01_experimental(State *state, DisplayList **dl) {
-            const uint32_t w0 = (*dl)->w0;
-            const uint32_t w1 = (*dl)->w1;
-            s_op01_last_ram = w1;
-            s_op01_last_w0 = w0;
-            // Decode w0 fields: byte 1 = ?, byte 2 = ?, byte 3 = count_or_size
-            const uint32_t b1 = (w0 >> 16) & 0xFF;
-            const uint32_t b2 = (w0 >> 8) & 0xFF;
-            const uint32_t b3 = w0 & 0xFF;
-            static int s_count = 0;
-            if (gbi_log_enabled() && (++s_count <= 8)) {
-                std::fprintf(stderr,
-                    "[gbi-f5 op01 #%d] w0=0x%08X (b1=%u b2=%u b3=%u) w1=0x%08X (ram src)\n",
-                    s_count, w0, b1, b2, b3, w1);
-                std::fflush(stderr);
+        static bool f5_ran_off_chunk(State* state, const DisplayList* dl) {
+            static bool s_on = env_on("ROGUESQ_F5_CHUNK_BOUND", true);
+            if (!s_on) return false;
+            const uint32_t off = f5_dl_off(state, dl);
+            if (state->displayListCounter != s_chunk_counter) {   // new task: root chunk starts here
+                s_chunk_counter = state->displayListCounter;
+                g_f5_task_hops = s_chunk_hops; g_f5_task_faces = s_task_faces; s_chunk_hops = 0; s_task_faces = 0; s_task_entries = 0; s_hop_n = 0;
+                std::memset(s_chunk_base, 0, sizeof(s_chunk_base));
+                std::memset(s_chain_len, 0, sizeof(s_chain_len));
+                s_chunk_base[0] = off;
+                return false;
             }
+            const uint32_t d = f5_depth(state);
+            return d < (uint32_t)F5_MAX_DEPTH && s_chunk_base[d] != 0 && off >= s_chunk_base[d] + 0x108u;
         }
-
-        void op_03_experimental(State *state, DisplayList **dl) {
-            const uint32_t w0 = (*dl)->w0;
-            const uint32_t w1 = (*dl)->w1;
-            s_op03_last_w0 = w0;
-            static int s_count = 0;
-            if (gbi_log_enabled() && (++s_count <= 8)) {
-                std::fprintf(stderr,
-                    "[gbi-f5 op03 #%d] w0=0x%08X w1=0x%08X\n",
-                    s_count, w0, w1);
-                std::fflush(stderr);
+        template <int OP>
+        static void f5_bounded(State* state, DisplayList** dl) {
+            if (f5_ran_off_chunk(state, *dl)) {
+                f5_next_chunk(state, dl);
+                return;
             }
-        }
-
-        // Matrix-vertex math for op 0x02. Reads the perspective matrix
-        // loaded from RAM 0x80700000 (verified to be a 4×4 projection
-        // matrix per project_attribution_op02_breakthrough_2026_05_13.md).
-        // Loads vertex data from RAM-pointed buffer, applies matrix
-        // transform + perspective divide, emits screen-space triangles.
-        //
-        // The math is faithful but the INPUT data sources (vertex pool,
-        // op count, primitive layout) are still uncertain — current cut
-        // uses placeholder vertex data based on the alternating
-        // 0x80700000/0x80710000 payload addresses we observed.
-        struct N64Matrix4x4 {
-            float m[4][4];  // row-major, [row][col]
-        };
-
-        // Decode an N64 fixed-point 4×4 matrix from RDRAM at offset `addr`.
-        // Layout: 32 bytes of int16 integer parts, then 32 bytes of uint16
-        // fractional parts; combined as (int << 16) | frac → s15.16 fixed.
-        static N64Matrix4x4 decode_n64_matrix(const uint8_t* rdram, uint32_t addr) {
-            N64Matrix4x4 mat = {};
-            const uint32_t phys = addr & 0x00FFFFFF;
-            auto load_be16 = [&](uint32_t off) -> uint16_t {
-                if (phys + off + 1 >= 0x800000) return 0;
-                uint8_t hi = rdram[(phys + off) ^ 3];
-                uint8_t lo = rdram[(phys + off + 1) ^ 3];
-                return (hi << 8) | lo;
-            };
-            for (int row = 0; row < 4; ++row) {
-                for (int col = 0; col < 4; ++col) {
-                    int idx = row * 4 + col;
-                    uint16_t ipart = load_be16(idx * 2);
-                    uint16_t fpart = load_be16(32 + idx * 2);
-                    int32_t combined = ((int32_t)(int16_t)ipart << 16) | fpart;
-                    mat.m[row][col] = (float)combined / 65536.0f;
-                }
-            }
-            return mat;
-        }
-
-        // Multiply a 4×4 matrix by a 4D vector (M × v → result).
-        static void mat_mul_vec(const N64Matrix4x4& m, const float v[4], float out[4]) {
-            for (int i = 0; i < 4; ++i) {
-                out[i] = m.m[i][0] * v[0] + m.m[i][1] * v[1] +
-                         m.m[i][2] * v[2] + m.m[i][3] * v[3];
-            }
-        }
-
-        // Apply perspective divide (1/w on x, y, z).
-        static void perspective_divide(float v[4]) {
-            if (v[3] != 0.0f) {
-                const float inv_w = 1.0f / v[3];
-                v[0] *= inv_w;
-                v[1] *= inv_w;
-                v[2] *= inv_w;
-            }
-        }
-
-        void op_02_experimental(State *state, DisplayList **dl) {
-            const uint32_t w0 = (*dl)->w0;
-            const uint32_t w1 = (*dl)->w1;
-            s_op02_count_this_dl++;
-            s_op02_fired_recently = true;
-
-            const uint32_t cimg = state->rdp->colorImage.address;
-            const auto& prim = state->rdp->primColorStack[state->rdp->primColorStackSize - 1];
-
-            static int s_count = 0;
-            int n = ++s_count;
-            if (gbi_log_enabled() && n <= 12) {
-                std::fprintf(stderr,
-                    "[gbi-f5 op02 #%d] w0=0x%08X w1=0x%08X "
-                    "cimg=0x%06X primRGBA=(%.2f %.2f %.2f %.2f) "
-                    "last_op01_ram=0x%08X last_op03_w0=0x%08X\n",
-                    n, w0, w1, cimg,
-                    (float)prim.x, (float)prim.y, (float)prim.z, (float)prim.w,
-                    s_op01_last_ram, s_op03_last_w0);
-                std::fflush(stderr);
-
-                // On first op_02 fire, decode + log the perspective
-                // matrix from the last-seen op 0x01 RAM address. This
-                // proves we can read the same matrix the real RSP uses.
-                if (n == 1 && s_op01_last_ram != 0) {
-                    auto mat = decode_n64_matrix(state->RDRAM, s_op01_last_ram);
-                    std::fprintf(stderr, "[gbi-f5 op02 matrix from 0x%08X]:\n", s_op01_last_ram);
-                    for (int r = 0; r < 4; ++r) {
-                        std::fprintf(stderr, "  %9.4f %9.4f %9.4f %9.4f\n",
-                            mat.m[r][0], mat.m[r][1], mat.m[r][2], mat.m[r][3]);
+            // Per-task budgets: a stale call into recycled chunks otherwise storms the parser with thousands of
+            // garbage faces (hw goldens: < 400 chunk entries, < 700 faces per task). Ending the task drops the
+            // rest of one frame instead of stalling for half a second.
+            static const uint32_t s_entry_cap = [](){ const char* e = std::getenv("ROGUESQ_F5_ENTRY_CAP"); return (e && *e) ? (uint32_t)std::atoi(e) : 2048u; }();
+            static const uint32_t s_face_cap = [](){ const char* e = std::getenv("ROGUESQ_F5_FACE_CAP"); return (e && *e) ? (uint32_t)std::atoi(e) : 4096u; }();
+            if (s_task_entries > s_entry_cap || s_task_faces > s_face_cap) {
+                static int s_n = 0;
+                if (gbi_log_enabled() && ++s_n <= 8) { std::fprintf(stderr, "[gbi-f5] task budget exceeded (entries %u faces %u); ending task\n", s_task_entries, s_task_faces); std::fflush(stderr); }
+                // ROGUESQ_DUMP_ON_BUDGET=<path>: RDRAM snapshot at the first budget trip (walk it offline with
+                // tools/validate/f5_dl_walk.py from the task's data_ptr to see where the list enters freed chunks).
+                static const char* s_dump = std::getenv("ROGUESQ_DUMP_ON_BUDGET");
+                static bool s_dumped = false;
+                if (s_dump && *s_dump && !s_dumped) {
+                    s_dumped = true;
+                    const uint32_t n = s_hop_n < 4096 ? s_hop_n : 4096;
+                    std::fprintf(stderr, "[gbi-f5] budget trip: last %u chunk transitions (from -> to depth: first payload words)\n", n);
+                    for (uint32_t i = 0; i < n; ++i) { const F5Hop& h = s_hops[(s_hop_n - n + i) & 4095]; std::fprintf(stderr, "  %06X -> %06X d%u: %08X %08X\n", h.from, h.to, h.depth, h.w0, h.w1); }
+                    if (FILE* f = std::fopen(s_dump, "wb")) {
+                        std::vector<uint8_t> buf(0x800000);   // heap: a static here would be instantiated per opcode
+                        for (uint32_t i = 0; i < buf.size(); ++i) buf[i] = state->RDRAM[i ^ 3];
+                        std::fwrite(buf.data(), 1, buf.size(), f); std::fclose(f);
+                        std::fprintf(stderr, "[gbi-f5] budget dump written: %s\n", s_dump); std::fflush(stderr);
                     }
-                    // Sanity-test the math: transform a known vertex
-                    // through the matrix + perspective divide.
-                    float v[4] = { 0.0f, 0.0f, -1.0f, 1.0f };  // unit point in front of camera
-                    float out[4];
-                    mat_mul_vec(mat, v, out);
-                    std::fprintf(stderr, "  test vertex (0,0,-1,1) -> (%.4f, %.4f, %.4f, %.4f)\n",
-                        out[0], out[1], out[2], out[3]);
-                    perspective_divide(out);
-                    std::fprintf(stderr, "  after /w: (%.4f, %.4f, %.4f, %.4f)\n",
-                        out[0], out[1], out[2], out[3]);
+                }
+                while (!state->returnAddressStack.empty()) state->popReturnAddress();
+                *dl = nullptr;
+                return;
+            }
+            if (s_inner[OP]) {
+                s_inner[OP](state, dl);
+            } else {
+                static int s_n = 0;
+                if (gbi_log_enabled() && ++s_n <= 4) {
+                    std::fprintf(stderr, "[gbi-f5] unknown op 0x%02X w0=0x%08X w1=0x%08X\n", OP, (*dl)->w0, (*dl)->w1);
                     std::fflush(stderr);
                 }
             }
-            // No drawing here — the actual visible-output emission happens
-            // inside fillRect_op02_aware. See note there for why the math
-            // result isn't emitted yet (RT64 deferred-state replay model
-            // means we'd need to use drawTris which has its own visibility
-            // issues to resolve before plumbing in the real math result).
+        }
+        template <int... I>
+        static void f5_install_bounded(GBI* gbi, std::integer_sequence<int, I...>) {
+            ((s_inner[I] = gbi->map[I], gbi->map[I] = &f5_bounded<I>), ...);
         }
 
-        // Wrapped fillRect_logged variant — when op 0x02 fired recently
-        // in the same DL and the about-to-fire fillRect would clear the
-        // entire screen with the canonical 0x00010001 black-with-alpha
-        // color, override fillColor to bright green BEFORE the clear
-        // runs. RT64's deferred-render pipeline captures the fillColor
-        // at fillRect enqueue time, so the original F6 fillRect's
-        // coords (full lo-res screen) get filled with our green
-        // instead of black. Visual result: bright-green band during
-        // attribution period — proving op 0x02 path is reachable.
-        //
-        // The "glyph pattern" experiment (post-clear small rects) didn't
-        // produce visible output — likely RT64's deferred-render sort
-        // order or coverage-based pixel masking suppresses the small
-        // rects when they overlap a same-frame clear. Faithful glyph
-        // shapes require the full op 0x02 vertex pipeline (or LLE).
-        void fillRect_logged(State *state, DisplayList **dl);  // fwd-decl
-        void fillRect_op02_aware(State *state, DisplayList **dl) {
-            if (op02_experimental_enabled() && s_op02_fired_recently) {
-                const uint32_t fillRaw = state->rdp->fillColorStack[state->rdp->fillColorStackSize - 1];
-                if (fillRaw == 0x00010001u) {
-                    // ROGUESQ_HLE_OP02_SKIP_CLEAR=1: drop the canonical
-                    // 0x00010001 fillRect during attribution entirely (no
-                    // green override, no clear at all). If the game is
-                    // CPU-painting or otherwise emitting real attribution
-                    // content into the same fb, skipping the clear lets
-                    // that content survive to the present step.
-                    static int s_skip_clear = -1;
-                    if (s_skip_clear < 0) {
-                        const char* v = std::getenv("ROGUESQ_HLE_OP02_SKIP_CLEAR");
-                        s_skip_clear = (v && *v && v[0] != '0') ? 1 : 0;
-                    }
-                    if (s_skip_clear) {
-                        static int s_skip_log = 0;
-                        if (gbi_log_enabled() && (++s_skip_log <= 4)) {
-                            std::fprintf(stderr,
-                                "[gbi-f5 fillRect-skip #%d] op02 recently fired; "
-                                "DROPPING canonical-black fillRect (cimg=0x%06X)\n",
-                                s_skip_log, state->rdp->colorImage.address);
-                            std::fflush(stderr);
+        // 0xB5 / 0x12: continue in the chunk named by the current chunk header (w1 ignored).
+        void op_b5_next_chunk(State* state, DisplayList** dl) {
+            f5_next_chunk(state, dl);
+        }
+
+        // 0x07: branch to chunk w1.
+        void op_07_branch(State* state, DisplayList** dl) {
+            const uint32_t target = state->rsp->fromSegmentedMasked((*dl)->w1);
+            if (target == 0 || target + 0x108u > RDRAMSize) { GBI_F3D::endDl(state, dl); return; }
+            f5_enter_chunk(state, dl, target);
+        }
+
+        // 0x06: call chunk w1 (push). Only the plain form is a call; Factor 5 reuses byte 0x06 with
+        // data in the low 24 bits otherwise.
+        void op_06_strict_dl(State* state, DisplayList** dl) {
+            const uint32_t w0Payload = (*dl)->w0 & 0x00FEFFFF;
+            if (w0Payload != 0) {
+                static int s_skip = 0;
+                if (gbi_log_enabled() && ++s_skip <= 8) {
+                    std::fprintf(stderr, "[gbi-f5] G_DL skip w0=0x%08X w1=0x%08X\n", (*dl)->w0, (*dl)->w1);
+                    std::fflush(stderr);
+                }
+                return;
+            }
+            const uint32_t target = state->rsp->fromSegmentedMasked((*dl)->w1);
+            if (target == 0 || target + 0x108u > RDRAMSize) return;
+            if (((*dl)->w0 >> 16) & 1) {
+                f5_enter_chunk(state, dl, target);
+            } else {
+                state->pushReturnAddress(*dl);
+                f5_enter_chunk(state, dl, target);
+            }
+        }
+
+        // 0x05 `05 05 02 xx` form (ucode overlays 0xC -> 0x24): a TERRAIN TILE quad. From the record
+        // (word index = 8-byte pairs after the command, halves hi/lo):
+        //   w1 = (h0,h1)  word2 = (h2,h3)          per-corner heights added to y
+        //   word3..word6 = RGBA colors of corners v0,v1,v2,v3
+        //   word7.lo = texcoord size s (8.8 texels)   word8 = (x, y>>4)   word9 = (z, size)
+        //   corners: v0=(x,y+h0,z) v1=(x+size,y+h1,z) v2=(x,y+h2,z+size) v3=(x+size,y+h3,z+size)
+        //   UVs: v0 (0,s) v1 (s,s) v2 (0,0) v3 (s,0); tris (v0,v3,v2) (v0,v1,v3), current MVP.
+        // The `05 05 00 xx` form DMAs a height/color grid and tessellates it (overlays 0x14/0x18): not yet.
+        static void f5_tile_quad(State* state, DisplayList* rec) {
+            if (!f5_native_active()) return;
+            static bool s_tiles = env_on("ROGUESQ_F5_TILES", true);
+            if (!s_tiles) return;
+            const uint32_t w1 = rec[0].w1, w2 = rec[1].w0;
+            const uint32_t col[4] = { rec[1].w1, rec[2].w0, rec[2].w1, rec[3].w0 };
+            const uint32_t w7 = rec[3].w1, w8 = rec[4].w0, w9 = rec[4].w1;
+            const int16_t h[4] = { (int16_t)(w1 >> 16), (int16_t)w1, (int16_t)(w2 >> 16), (int16_t)w2 };
+            const int32_t x = (int16_t)(w8 >> 16), y = (int32_t)(int16_t)w8 << 4, z = (int16_t)(w9 >> 16), sz = (int16_t)w9;
+            const int16_t s = (int16_t)((int16_t)(w7 & 0xFFFF) / 8);   // 8.8 texels -> s10.5
+            f5_ensure_viewport(state);
+            RSP::Vertex* tmp = reinterpret_cast<RSP::Vertex*>(state->fromRDRAM(F5_VTX_SCRATCH + F5_FACE_SLOT * sizeof(RSP::Vertex)));
+            const int32_t px[4] = { x, x + sz, x, x + sz }, pz[4] = { z, z, z + sz, z + sz };
+            const int16_t us[4] = { 0, s, 0, s }, vt[4] = { s, s, 0, 0 };
+            for (int k = 0; k < 4; ++k) {
+                tmp[k].x = (int16_t)px[k]; tmp[k].y = (int16_t)(y + h[k]); tmp[k].z = (int16_t)pz[k]; tmp[k].flag = 0;
+                tmp[k].s = us[k]; tmp[k].t = vt[k];
+                tmp[k].color.r = (uint8_t)(col[k] >> 24); tmp[k].color.g = (uint8_t)(col[k] >> 16);
+                tmp[k].color.b = (uint8_t)(col[k] >> 8);  tmp[k].color.a = (uint8_t)col[k];
+            }
+            state->rsp->setVertex(0x80000000u | (F5_VTX_SCRATCH + F5_FACE_SLOT * sizeof(RSP::Vertex)), 4, F5_FACE_SLOT);
+            state->rsp->drawIndexedTri(F5_FACE_SLOT, F5_FACE_SLOT + 3, F5_FACE_SLOT + 2);
+            state->rsp->drawIndexedTri(F5_FACE_SLOT, F5_FACE_SLOT + 1, F5_FACE_SLOT + 3);
+            s_task_faces += 2;
+        }
+
+        // 0x05 `05 05 00 xx` form: a 5x5 SIGNED-height terrain tile (HMP tile height_values[25]).
+        // rec[1].w0 -> 25 s8 heights, rec[1].w1 -> 25 RGBA8888 vertex colors (+ per-tile LOD in low bytes),
+        // w7.lo = texcoord span, w8/w9 = tile x,y,z,size (same encoding as the flat tile). Heights are the
+        // flat s16 heights >>4, so worldY = base + h*16 (ROGUESQ_F5_TERRAIN_HSCALE multiplies). The 5x5 is
+        // bilinear-subdivided to a finer mesh (ROGUESQ_F5_TERRAIN_SUB, default 2) for smooth slopes.
+        static void f5_tile_grid(State* state, DisplayList* rec) {
+            if (!f5_native_active()) return;
+            static bool s_grid = env_on("ROGUESQ_F5_TERRAIN", true);
+            if (!s_grid) return;
+            static float s_hmul = 1.0f; static int s_hmul_set = 0;   // extra user tuning multiplier (rerogue-derived coeff = 1.0)
+            if (!s_hmul_set) { s_hmul_set = 1; const char* v = std::getenv("ROGUESQ_F5_TERRAIN_HSCALE"); if (v && *v) s_hmul = (float)std::atof(v); }
+            const uint32_t hptr = rec[1].w0 & 0x00FFFFFFu;   // 25 s8 heights (5x5)
+            const uint32_t cptr = rec[1].w1 & 0x00FFFFFFu;   // 25 RGBA8888 vertex colors
+            const uint32_t w7 = rec[3].w1, w8 = rec[4].w0, w9 = rec[4].w1;
+            const int32_t x = (int16_t)(w8 >> 16), y = (int32_t)(int16_t)w8 << 4, z = (int16_t)(w9 >> 16), sz = (int16_t)w9;
+            const int16_t s = (int16_t)((int16_t)(w7 & 0xFFFF) / 8);   // 8.8 texels -> s10.5
+            const uint8_t* ram = state->RDRAM;
+            // Grid heights are the flat-tile s16 heights compressed to s8 (>>4): flat corner heights run
+            // 544..2032, grid s8 run 31..110, ratio ~16. So grid worldY = h<<4 to seat against flat tiles
+            // (using a smaller scale drops grid tiles below the flat plateaus -> stepped layers). Env mult tunes.
+            const float hcoeff = 16.0f * s_hmul;
+            f5_ensure_viewport(state);
+            int8_t H[25];
+            for (int k = 0; k < 25; ++k) H[k] = (int8_t)ram[(hptr + (uint32_t)k) ^ 3];
+            // Stitch to flat neighbors: a grid edge facing a coarse (flat-rendered) neighbor must be a
+            // straight line between its corners, else its subdivided intermediate verts T-junction with the
+            // flat quad. Detect flat vs grid neighbors from the level tile grid (D_80136DC0): grid cells have
+            // tile-index top bits 110 (raw & 0xE000 == 0xC000), flat/coarse cells don't. Verified offline.
+            bool stL = false, stR = false, stU = false, stD = false;
+            {
+                static bool s_stitch = env_on("ROGUESQ_F5_TERRAIN_STITCH", true);
+                if (s_stitch) {
+                    auto rd32 = [&](uint32_t a){ return ((uint32_t)ram[a^3]<<24)|((uint32_t)ram[(a+1)^3]<<16)|((uint32_t)ram[(a+2)^3]<<8)|(uint32_t)ram[(a+3)^3]; };
+                    auto rd16 = [&](uint32_t a){ return (uint32_t)((ram[a^3]<<8)|ram[(a+1)^3]); };
+                    const uint32_t idxArr = rd32(0x136DC0) & 0x00FFFFFFu, tileData = rd32(0x136DC4) & 0x00FFFFFFu;
+                    const uint32_t gw = rd16(0x136DF8), gh = rd16(0x136DFA);   // hdr +0x38 width, +0x3A height
+                    const int csz = sz * 2;                                    // tile world spacing = 2*size
+                    if (idxArr > 0x1000 && idxArr < RDRAMSize && tileData > 0x1000 && tileData < RDRAMSize &&
+                        gw > 0 && gw <= 256 && gh > 0 && gh <= 256 && csz > 0) {
+                        static uint32_t s_idxArr = 0; static int s_ox = 0, s_oz = 0; static bool s_ook = false;
+                        if (idxArr != s_idxArr) s_ook = false;                 // new level: re-derive origin
+                        if (!s_ook) {                                         // derive origin from this tile's cell
+                            const uint32_t ti = (hptr - 5u - tileData) / 0x1Eu;
+                            for (uint32_t r2 = 0; r2 < gh && !s_ook; ++r2) for (uint32_t c2 = 0; c2 < gw; ++c2)
+                                if ((rd16(idxArr + (r2 * gw + c2) * 2) & 0x1FFF) == ti) {
+                                    s_ox = x - (int)c2 * csz; s_oz = z - (int)r2 * csz; s_idxArr = idxArr; s_ook = true; break; }
                         }
-                        // Don't advance *dl — the dispatch loop does that.
-                        // We just don't call state->rdp->fillRect, so no
-                        // FILL_RECTANGLE reaches the deferred RDP.
-                        return;
+                        if (s_ook) {
+                            const int col = (x - s_ox) / csz, row = (z - s_oz) / csz;
+                            auto flatNb = [&](int c, int r) -> bool {         // true = coarse neighbor -> straighten edge
+                                if (c < 0 || r < 0 || c >= (int)gw || r >= (int)gh) return false;   // off-map: no crack
+                                return (rd16(idxArr + ((uint32_t)r * gw + (uint32_t)c) * 2) & 0xE000u) != 0xC000u; };
+                            stL = flatNb(col - 1, row); stR = flatNb(col + 1, row);
+                            stU = flatNb(col, row - 1); stD = flatNb(col, row + 1);
+                        }
                     }
-                    static int s_replace = 0;
-                    if (gbi_log_enabled() && (++s_replace <= 4)) {
-                        std::fprintf(stderr,
-                            "[gbi-f5 fillRect-replace #%d] op02 recently fired; "
-                            "overriding clear fillColor to green (cimg=0x%06X)\n",
-                            s_replace, state->rdp->colorImage.address);
-                        std::fflush(stderr);
-                    }
-                    // Override stack-top fillColor to bright green BEFORE
-                    // calling fillRect_logged. The original F6 fillRect
-                    // command will then enqueue with our color.
-                    state->rdp->setFillColor(0x07C107C1);
-                    fillRect_logged(state, dl);
-                    // Probe: try a single triangle via drawTris to test
-                    // whether the API is usable for the eventual matrix-
-                    // vertex pipeline output. ROGUESQ_HLE_OP02_DRAW_TRI_TEST=1
-                    // enables this single test triangle on the green background.
-                    static int s_tri_test = -1;
-                    if (s_tri_test < 0) {
-                        const char* v = std::getenv("ROGUESQ_HLE_OP02_DRAW_TRI_TEST");
-                        s_tri_test = (v && *v && v[0] != '0') ? 1 : 0;
-                    }
-                    if (s_tri_test) {
-                        // drawTris path proven working (cycle FILL→1CYCLE,
-                        // G_CC_PRIMITIVE combiner, white prim color). The
-                        // previous bitmap-font test rendered readable
-                        // "LucasArts" / "Factor 5" text but that was our
-                        // own font, NOT the game's actual attribution
-                        // glyphs. Don't render placeholder text here —
-                        // attribution rendering should use the game's
-                        // actual vertex/glyph data once we trace its
-                        // source. For now, no drawTris emit; user sees
-                        // bright-green attribution screen (proves the
-                        // green fillRect override path works) while the
-                        // real implementation work continues.
-                    }
-                    return;
                 }
             }
+            // Subdivision: the ucode (overlay 0x14) subdivides the 5x5 into a finer interpolated mesh for
+            // smooth slopes; raw 5x5 quads look faceted. Bilinear-interpolate to (4*S+1)^2 verts. S from env
+            // (per-tile LOD lives in w1 low bytes; uniform S avoids inter-tile cracks). Grid tiles span 2*size
+            // (per sample-cell = size/2); UV spans the tile over the 4 sample-cells; color grid is coarse
+            // (real values at even samples, odd are checkerboard filler) so sample the nearest even cell.
+            static int s_sub = -1;
+            if (s_sub < 0) { const char* v = std::getenv("ROGUESQ_F5_TERRAIN_SUB"); s_sub = (v && *v) ? std::atoi(v) : 2; if (s_sub < 1) s_sub = 1; if (s_sub > 4) s_sub = 4; }
+            const int N = 4 * s_sub;   // cells per axis; N+1 verts per axis; 2*(N+1) <= 34 slots for S<=4
+            RSP::Vertex* tmp = reinterpret_cast<RSP::Vertex*>(state->fromRDRAM(F5_VTX_SCRATCH + F5_FACE_SLOT * sizeof(RSP::Vertex)));
+            auto emit_vertex = [&](RSP::Vertex& v, float fx, float fy) {
+                // On an edge facing a flat neighbor, follow the straight line between the tile's edge corners
+                // (matches the flat quad's straight edge); otherwise bilinear-interpolate the 5x5 samples.
+                float h;
+                if      (fx <= 0.0f && stL) h = (float)H[0] * (1.0f - fy/4.0f) + (float)H[20] * (fy/4.0f);   // left edge (col 0)
+                else if (fx >= 4.0f && stR) h = (float)H[4] * (1.0f - fy/4.0f) + (float)H[24] * (fy/4.0f);   // right edge (col 4)
+                else if (fy <= 0.0f && stU) h = (float)H[0] * (1.0f - fx/4.0f) + (float)H[4]  * (fx/4.0f);   // top edge (row 0)
+                else if (fy >= 4.0f && stD) h = (float)H[20]* (1.0f - fx/4.0f) + (float)H[24] * (fx/4.0f);   // bottom edge (row 4)
+                else {
+                    int x0 = (int)fx, y0 = (int)fy; if (x0 > 3) x0 = 3; if (y0 > 3) y0 = 3;
+                    const float tx = fx - x0, ty = fy - y0;
+                    h = ((float)H[y0*5+x0]*(1-tx) + (float)H[y0*5+x0+1]*tx) * (1-ty)
+                      + ((float)H[(y0+1)*5+x0]*(1-tx) + (float)H[(y0+1)*5+x0+1]*tx) * ty;
+                }
+                v.x = (int16_t)(x + (int32_t)(fx * (float)sz * 0.5f));
+                v.y = (int16_t)(y + (int32_t)(h * hcoeff));
+                v.z = (int16_t)(z + (int32_t)(fy * (float)sz * 0.5f));
+                v.flag = 0; v.s = (int16_t)(s * fx / 4.0f); v.t = (int16_t)(s * fy / 4.0f);
+                int cx = ((int)(fx + 0.5f)) & ~1, cy = ((int)(fy + 0.5f)) & ~1;
+                if (cx > 4) cx = 4; if (cy > 4) cy = 4;
+                const uint32_t cb = cptr + (uint32_t)(cy * 5 + cx) * 4;
+                v.color.r = ram[(cb + 0) ^ 3]; v.color.g = ram[(cb + 1) ^ 3];
+                v.color.b = ram[(cb + 2) ^ 3]; v.color.a = ram[(cb + 3) ^ 3];
+            };
+            const uint32_t base = 0x80000000u | (F5_VTX_SCRATCH + F5_FACE_SLOT * sizeof(RSP::Vertex));
+            for (int rr = 0; rr < N; ++rr) {   // one 2-row strip at a time
+                for (int cc = 0; cc <= N; ++cc) {
+                    emit_vertex(tmp[cc],           (float)cc / s_sub, (float)rr / s_sub);
+                    emit_vertex(tmp[(N + 1) + cc], (float)cc / s_sub, (float)(rr + 1) / s_sub);
+                }
+                state->rsp->setVertex(base, 2 * (N + 1), F5_FACE_SLOT);
+                for (int cc = 0; cc < N; ++cc) {
+                    const int v0 = F5_FACE_SLOT + cc, v2 = F5_FACE_SLOT + (N + 1) + cc;
+                    state->rsp->drawIndexedTri(v0, v2 + 1, v2);      // (v0,v3,v2)
+                    state->rsp->drawIndexedTri(v0, v0 + 1, v2 + 1);  // (v0,v1,v3)
+                }
+            }
+            s_task_faces += 2;   // count the DL record (runaway guard = ~faces/task), NOT the subdivided tris
+        }
+
+        void op_05_record(State* state, DisplayList** dl) {
+            const uint32_t w0 = (*dl)->w0;
+            if (((w0 >> 16) & 0xFFu) != 0x05u) return;      // plain 8-byte command
+            if ((w0 >> 8) & 0x2u) f5_tile_quad(state, *dl);   // 05 05 02 = flat tile
+            else                  f5_tile_grid(state, *dl);   // 05 05 00 = heightfield grid
+            (*dl) += 4;                                       // 40-byte record
+        }
+
+        // 0x03: 24 bytes: byte 1 selects a DMEM slot, the next 16 bytes are stored there inline.
+        // 0x80 = viewport (vscale x,y,z,pad, vtrans x,y,z,pad in 2-bit fixed); 0x82 = lookat/light data.
+        static void f5_set_viewport(State* state, const int16_t* vs, const int16_t* vt);
+        void op_03_f5(State* state, DisplayList** dl) {
+            const uint32_t sub = ((*dl)->w0 >> 16) & 0xFF;
+            if (sub == 0x80) {
+                const uint32_t a = (*dl)[1].w0, b = (*dl)[1].w1, c = (*dl)[2].w0, d = (*dl)[2].w1;
+                const int16_t vs[4] = { (int16_t)(a >> 16), (int16_t)a, (int16_t)(b >> 16), (int16_t)b };
+                const int16_t vt[4] = { (int16_t)(c >> 16), (int16_t)c, (int16_t)(d >> 16), (int16_t)d };
+                f5_set_viewport(state, vs, vt);
+            }
+            (*dl) += 2;
+        }
+
+        // ------------------------------------------------ geometry state
+        // Scratch RDRAM (zero on hardware in every golden): converted vertices + a viewport.
+
+        static thread_local uint32_t s_cache_count = 0;
+        static thread_local uint32_t s_vp_key = 0;
+
+        // Factor 5's stream never sends G_MW_CLIP; stock ucode sets clip ratio 2 (guard band) in reset().
+        // Without it the F5 path keeps the RSP default (1 = no guard band), so large/close geometry and
+        // near terrain get clipped at the exact viewport edges. Match stock: apply ratio 2 (env-tunable).
+        static void f5_apply_clip_ratio(State* state) {
+            static int s_cr = -1;
+            if (s_cr < 0) { const char* v = std::getenv("ROGUESQ_F5_CLIPRATIO"); s_cr = (v && *v) ? std::atoi(v) : 2; if (s_cr < 1) s_cr = 1; if (s_cr > 15) s_cr = 15; }
+            state->rsp->setClipRatioAll((int16_t)s_cr);
+        }
+
+        // Viewport from the stream's inline `03 80` block (2-bit fixed, N64 Vp layout).
+        static void f5_set_viewport(State* state, const int16_t* vs, const int16_t* vt) {
+            F5Vp* vp = reinterpret_cast<F5Vp*>(state->fromRDRAM(F5_VP_SCRATCH));
+            // Factor 5's NDC is y-down (the ucode adds ndc*vscale with no negation; hw frame 300 puts the
+            // X-wing at ndc y +0.8 = bottom of the screen). RT64 negates y for F3D, so hand it -vscale.y.
+            static bool s_flip = env_on("ROGUESQ_F5_FLIP_Y", true);
+            vp->vscale[1] = vs[0]; vp->vscale[0] = (int16_t)(s_flip ? -vs[1] : vs[1]); vp->vscale[3] = vs[2]; vp->vscale[2] = vs[3];
+            vp->vtrans[1] = vt[0]; vp->vtrans[0] = vt[1]; vp->vtrans[3] = vt[2]; vp->vtrans[2] = vt[3];
+            state->rsp->setViewport(0x80000000u | F5_VP_SCRATCH);
+            f5_apply_clip_ratio(state);
+            s_vp_key = 0xFFFFFFFFu;   // stream-provided: no synthesis until the next task
+        }
+
+        // Factor 5's stream never sends G_VIEWPORT (its ucode maps to the screen itself), so derive
+        // one from the current scissor rectangle whenever it changes.
+        static void f5_ensure_viewport(State* state) {
+            const FixedRect& r = state->rdp->scissorRectStack[state->rdp->scissorStackSize - 1];
+            int w = (r.lrx - r.ulx) / 4, h = (r.lry - r.uly) / 4;
+            if (w <= 0 || w > 1024 || h <= 0 || h > 1024) { w = 320; h = 240; }
+            const uint32_t key = ((uint32_t)w << 16) | (uint32_t)h;
+            if (key == s_vp_key || s_vp_key == 0xFFFFFFFFu) return;
+            s_vp_key = key;
+            F5Vp* vp = reinterpret_cast<F5Vp*>(state->fromRDRAM(F5_VP_SCRATCH));
+            const int16_t xs = (int16_t)(w * 2), ys = (int16_t)(h * 2);   // half-size in 2-bit fixed
+            static bool s_flip2 = env_on("ROGUESQ_F5_FLIP_Y", true);
+            vp->vscale[1] = xs; vp->vscale[0] = (int16_t)(s_flip2 ? -ys : ys); vp->vscale[3] = 511; vp->vscale[2] = 0;
+            vp->vtrans[1] = (int16_t)(xs + r.ulx / 2); vp->vtrans[0] = (int16_t)(ys + r.uly / 2); vp->vtrans[3] = 511; vp->vtrans[2] = 0;
+            state->rsp->setViewport(0x80000000u | F5_VP_SCRATCH);
+            f5_apply_clip_ratio(state);
+        }
+
+        // 0x01: matrix load. byte1 0x03 = projection, 0x02 = modelview; a matrix whose bottom-right
+        // element is 0 with a non-zero [2][3] is a projection whatever the byte says.
+        void op_01_matrix(State* state, DisplayList** dl) {
+            const uint32_t w0 = (*dl)->w0, w1 = (*dl)->w1;
+            const uint32_t addr = state->rsp->fromSegmentedMasked(w1);
+            if (addr + 64 > RDRAMSize) return;
+            const uint8_t* ram = state->RDRAM;
+            const int m33 = rd_be_s16(ram, w1 + 2 * 15), m23 = rd_be_s16(ram, w1 + 2 * 11);
+            const bool proj = (((w0 >> 16) & 0xFF) == 0x03) || (m33 == 0 && m23 != 0);
+            if (!f5_native_active()) return;
+            f5_ensure_viewport(state);
+            state->rsp->matrix(w1, proj ? 0x03 : 0x02);   // F3D constants: PROJECTION=1, LOAD=2
+        }
+
+        // 0x02: per-vertex RGBA staging buffer for the next vertex batch.
+        void op_02_colors(State*, DisplayList** dl) {
+            s_last_op02_colorbuf = (*dl)->w1;
+            s_last_op02_colorcnt = ((*dl)->w0 & 0xFFFu) + 1u;
+        }
+
+        // 0x04 / 0x14: vertex batch. Converts the 8-byte vertices + staged colors into N64 Vtx in
+        // scratch RDRAM and loads them into RT64's cache at slot 0.
+        void op_04_vertex(State* state, DisplayList** dl) {
+            const uint32_t w0 = (*dl)->w0, w1 = (*dl)->w1;
+            const uint32_t n = (w0 >> 10) & 0x3F;
+            const uint32_t src = state->rsp->fromSegmentedMasked(w1);
+            if (n == 0 || src + n * 8 > RDRAMSize) return;
+            if (!f5_native_active()) return;
+            f5_ensure_viewport(state);
+            const uint8_t* ram = state->RDRAM;
+            const uint32_t cbuf = s_last_op02_colorbuf;
+            const bool haveColors = cbuf >= 0x80000000u && ((cbuf & 0x00FFFFFFu) + n * 4) <= RDRAMSize;
+            RSP::Vertex* out = reinterpret_cast<RSP::Vertex*>(state->fromRDRAM(F5_VTX_SCRATCH));
+            for (uint32_t i = 0; i < n; ++i) {
+                const uint32_t va = w1 + i * 8;
+                out[i].x = (int16_t)rd_be_s16(ram, va);
+                out[i].y = (int16_t)rd_be_s16(ram, va + 2);
+                out[i].z = (int16_t)rd_be_s16(ram, va + 4);
+                out[i].flag = 0;
+                out[i].s = 0;
+                out[i].t = 0;
+                const uint32_t c = haveColors ? rd_be_u32(ram, cbuf + i * 4) : 0xFFFFFFFFu;
+                out[i].color.r = (uint8_t)(c >> 24);
+                out[i].color.g = (uint8_t)(c >> 16);
+                out[i].color.b = (uint8_t)(c >> 8);
+                out[i].color.a = (uint8_t)c;
+            }
+            state->rsp->setVertex(0x80000000u | F5_VTX_SCRATCH, n, 0);
+            s_cache_count = n;
+        }
+
+        // Emit one face from cache indices. Texcoords are per-face (8.8 texels), so the referenced
+        // vertices are re-emitted into temp slots with their UVs (s10.5 = raw / 8).
+        static void f5_emit_face(State* state, const uint32_t* idx, int n, const uint32_t* st, uint32_t colorWord) {
+            if (!f5_native_active()) return;
+            RSP::Vertex* tmp = reinterpret_cast<RSP::Vertex*>(state->fromRDRAM(F5_VTX_SCRATCH + F5_FACE_SLOT * sizeof(RSP::Vertex)));
+            const uint32_t cbuf = s_last_op02_colorbuf;
+            const bool haveColors = cbuf >= 0x80000000u && ((cbuf & 0x00FFFFFFu) + 0x100u) <= RDRAMSize;
+            // word 2 = per-vertex byte offsets into the op_02 color buffer (v0..v3 in bytes 1,2,3,0)
+            const uint32_t cofs[4] = { (colorWord >> 16) & 0xFF, (colorWord >> 8) & 0xFF, colorWord & 0xFF, colorWord >> 24 };
+            for (int k = 0; k < n; ++k) {
+                if (idx[k] >= F5_FACE_SLOT || idx[k] >= s_cache_count) return;   // garbage / stale index
+                tmp[k] = state->rsp->vertices[idx[k]];
+                if (haveColors) {
+                    const uint32_t c = rd_be_u32(state->RDRAM, cbuf + cofs[k]);
+                    tmp[k].color.r = (uint8_t)(c >> 24); tmp[k].color.g = (uint8_t)(c >> 16);
+                    tmp[k].color.b = (uint8_t)(c >> 8);  tmp[k].color.a = (uint8_t)c;
+                }
+                if (st) {
+                    tmp[k].s = (int16_t)((int16_t)(st[k] >> 16) / 8);
+                    tmp[k].t = (int16_t)((int16_t)(st[k] & 0xFFFF) / 8);
+                }
+            }
+            // Copy cycle type + triangles is undefined on hardware (RT64 asserts): a stale-walk symptom, skip the face.
+            if (state->rdp->otherMode.cycleType() == G_CYC_COPY) { ++s_task_faces; return; }
+            // DIAG (ROGUESQ_LOG_GBI): the filter/cycle a MODEL face actually draws with. Point vs bilerp
+            // decides whether models are blocky (point) or smooth. Bounded to the first few faces.
+            { static int s_ff = 0; if (gbi_log_enabled() && ++s_ff <= 8) {
+                std::fprintf(stderr, "[f5-face] n=%d textFilt=%u cycle=%u otherH=0x%08X otherL=0x%08X\n",
+                    n, state->rdp->otherMode.textFilt(), state->rdp->otherMode.cycleType(),
+                    state->rdp->otherMode.H, state->rdp->otherMode.L);
+                std::fflush(stderr); } }
+            state->rsp->setVertex(0x80000000u | (F5_VTX_SCRATCH + F5_FACE_SLOT * sizeof(RSP::Vertex)), n, F5_FACE_SLOT);
+            state->rsp->drawIndexedTri(F5_FACE_SLOT, F5_FACE_SLOT + 1, F5_FACE_SLOT + 2);
+            if (n == 4) state->rsp->drawIndexedTri(F5_FACE_SLOT, F5_FACE_SLOT + 2, F5_FACE_SLOT + 3);
+            ++s_task_faces;
+        }
+
+        // 0xBF: triangle. 16 bytes (cmd, indices*4 + flags); `w0&2` adds 8 bytes = per-face UVs
+        // (words 3..5 of the 24-byte form).
+        void op_bf_tri(State* state, DisplayList** dl) {
+            const uint32_t w0 = (*dl)->w0, w1 = (*dl)->w1;
+            const bool textured = (w0 & 0x2) != 0;
+            const uint32_t idx[3] = { ((w1 >> 16) & 0xFF) / 5u, ((w1 >> 8) & 0xFF) / 5u, (w1 & 0xFF) / 5u };
+            g_op_bf_count = g_op_bf_count + 1;
+            if (textured) {
+                // 32 bytes like 0xB4: [cmd][idx*5][idx*4][flags][st0][st1][st2][pad]
+                const uint32_t st[3] = { (*dl)[2].w0, (*dl)[2].w1, (*dl)[3].w0 };
+                f5_emit_face(state, idx, 3, st, (*dl)[1].w0);
+                (*dl) += 3;
+            } else {
+                f5_emit_face(state, idx, 3, nullptr, (*dl)[1].w0);
+                (*dl) += 1;
+            }
+        }
+
+        // 0xB4: oriented quad, 32 bytes: indices*5 (w1), indices*4, flags, 4 UVs. Chunk-tail filler
+        // (byte ramps) means the walk left the list: return.
+        void op_b4_quad(State* state, DisplayList** dl) {
+            const uint32_t w0 = (*dl)->w0, w1 = (*dl)->w1;
+            static bool s_guard = !env_on("ROGUESQ_F5_NOFILLERGUARD", false);
+            if (s_guard && (f5_is_byte_ramp(w0) || f5_is_byte_ramp(w1))) {
+                *dl = state->popReturnAddress();
+                return;
+            }
+            const uint32_t idx[4] = { (w1 >> 24) / 5u, ((w1 >> 16) & 0xFF) / 5u, ((w1 >> 8) & 0xFF) / 5u, (w1 & 0xFF) / 5u };
+            // Textured (w0&2) = 32 bytes with a 4-UV block; untextured = 16 bytes, no UVs. Mirrors
+            // op_13_quad and the hardware stride: an unconditional 32 reads the next command as bogus UVs
+            // AND over-advances 16 bytes, running the walk away on any DL with untextured 0xB4 (proven vs
+            // cine_frame300 with tools/validate/f5_dl_walk.py --b4). ROGUESQ_F5_B4_LEN16 forces the 16B path.
+            static bool s_len16 = env_on("ROGUESQ_F5_B4_LEN16", false);
+            if (!s_len16 && (w0 & 0x2)) {
+                const uint32_t st[4] = { (*dl)[2].w0, (*dl)[2].w1, (*dl)[3].w0, (*dl)[3].w1 };
+                f5_emit_face(state, idx, 4, st, (*dl)[1].w0);
+                (*dl) += 3;
+            } else {
+                f5_emit_face(state, idx, 4, nullptr, (*dl)[1].w0);
+                (*dl) += 1;
+            }
+        }
+
+        // 0x13: quad variant with the 0xBF framing (4 indices in w1; `w0&2` = UV block).
+        void op_13_quad(State* state, DisplayList** dl) {
+            const uint32_t w0 = (*dl)->w0, w1 = (*dl)->w1;
+            const uint32_t idx[4] = { (w1 >> 24) / 5u, ((w1 >> 16) & 0xFF) / 5u, ((w1 >> 8) & 0xFF) / 5u, (w1 & 0xFF) / 5u };
+            if (w0 & 0x2) {
+                const uint32_t st[4] = { (*dl)[2].w0, (*dl)[2].w1, (*dl)[3].w0, (*dl)[3].w1 };
+                f5_emit_face(state, idx, 4, st, (*dl)[1].w0);
+                (*dl) += 3;
+            } else {
+                f5_emit_face(state, idx, 4, nullptr, (*dl)[1].w0);
+                (*dl) += 1;
+            }
+        }
+
+        // 0xBB: G_TEXTURE. The stream sends scale 0 (`BB000001 00000000`), which collapses RT64's
+        // texcoords to texel 0; the ucode ignores the scale, so force full scale.
+        void texture_f5(State* state, DisplayList** dl) {
+            const uint8_t tile = (*dl)->p0(8, 3), level = (*dl)->p0(11, 3), on = (*dl)->p0(0, 8);
+            uint16_t sc = (*dl)->p1(16, 16), tc = (*dl)->p1(0, 16);
+            if (sc == 0) sc = 0xFFFF;
+            if (tc == 0) tc = 0xFFFF;
+            state->rsp->setTexture(tile, level, on, sc, tc);
+        }
+
+        // fillRect wrapper kept for the rdpstate module's declaration (op_02 coupling is gone).
+        void fillRect_op02_aware(State* state, DisplayList** dl) {
             fillRect_logged(state, dl);
         }
 
-
-        // op 0xB4 / op 0xBF: 16-byte commands (cmd word + 8-byte payload).
-        // Drift detector showed every drift-into-ASCII transition was
-        // preceded by op_B4 / op_BF dispatched at standard 8-byte stride.
-        // Consume the extra word so the dispatch loop's dl++ aligns to the
-        // next real command.
-        void op_consume16(State *state, DisplayList **dl) {
-            (*dl)++;  // skip the 8-byte payload
-        }
-
-        // op 0x06 strict G_DL filter. Standard F3D G_DL has w0=0x06000000
-        // (opcode + branch flag at bit 16, rest zero). Factor 5 emits
-        // commands sharing first byte 0x06 but packing data into w0's low
-        // 24 bits (e.g. w0=0x060A07C0). Treating those as G_DLs lets runDl
-        // dispatch w1 as a target address — corrupts the interpreter state.
-        // Filter: only delegate to F3D::runDl if w0's payload bits (excluding
-        // branch flag at bit 16) are zero.
-        void op_06_strict_dl(State *state, DisplayList **dl) {
-            const uint32_t w0Payload = (*dl)->w0 & 0x00FEFFFF;
-            static int s_pass = 0, s_skip = 0;
-            if (w0Payload == 0) {
-                if (gbi_log_enabled() && (++s_pass <= 8)) {
-                    std::fprintf(stderr,
-                        "[gbi-f5] G_DL pass #%d w0=0x%08X w1=0x%08X (target)\n",
-                        s_pass, (*dl)->w0, (*dl)->w1);
-                    std::fflush(stderr);
-                }
-                GBI_F3D::runDl(state, dl);
-            }
-            else {
-                if (gbi_log_enabled() && (++s_skip <= 8)) {
-                    std::fprintf(stderr,
-                        "[gbi-f5] G_DL skip #%d w0=0x%08X w1=0x%08X (opcode reuse)\n",
-                        s_skip, (*dl)->w0, (*dl)->w1);
-                    std::fflush(stderr);
-                }
-            }
-        }
-
-        // op 0xFF (G_SETCIMG) filter. Factor 5 emits one G_SETCIMG with a
-        // bogus payload (w0=0xFFF00F0F, w1=0) immediately before the overlay
-        // TEXRECT batch. That zeroes RDP::colorImage.address; subsequent
-        // TEXRECTs render onto a null target. Real SETCIMGs always carry a
-        // non-zero w1.
-        //
-        // Also reject when fmt field (w0 bits 23-21) is invalid (>4). Standard
-        // G_IM_FMT values: RGBA=0, YUV=1, CI=2, IA=3, I=4. fmt 5,6,7 only
-        // appear when garbage (e.g. RGBA8888 pixel = 0xFFFFFFFF) is parsed
-        // as a SETCIMG cmd. Without this gate, downstream allocators get fed
-        // bogus fmt+siz+width and crash with zero-size buffer asserts in
-        // D3D12MemoryAllocator.
-        // Permissive moveMem (op 0x03). F3D's default asserts on any subcode
-        // outside the standard set (viewport/lookat/L0-L7/matrix1). Factor 5's
-        // ucode emits subcodes the stock F3D handler does not know; rather
-        // than crashing, log each unknown subcode once via the env-gated
-        // ROGUESQ_LOG_GBI=1 channel and treat as a no-op so the dispatch loop
-        // keeps moving.
-        void moveMem_permissive(State *state, DisplayList **dl) {
-            const uint32_t subcode = (*dl)->p0(16, 8);
-            switch (subcode) {
-                case F3D_G_MV_VIEWPORT:
-                case F3D_G_MV_MATRIX_1:
-                case F3D_G_MV_L0: case F3D_G_MV_L1: case F3D_G_MV_L2:
-                case F3D_G_MV_L3: case F3D_G_MV_L4: case F3D_G_MV_L5:
-                case F3D_G_MV_L6: case F3D_G_MV_L7:
-                case F3D_G_MV_LOOKATX: case F3D_G_MV_LOOKATY:
-                    GBI_F3D::moveMem(state, dl);
-                    return;
-                default: {
-                    static std::unordered_set<uint32_t> s_seen;
-                    if (gbi_log_enabled() && s_seen.insert(subcode).second) {
-                        std::fprintf(stderr,
-                            "[gbi-f5] moveMem unknown subcode=0x%02X w0=0x%08X w1=0x%08X (no-op)\n",
-                            subcode, (*dl)->w0, (*dl)->w1);
-                        std::fflush(stderr);
-                    }
-                    return;
-                }
-            }
-        }
-
-        // setOtherMode + setScissor logging. Pass-through. We want to see
-        // what cycle/blend/render-mode state Factor 5 sets up before
-        // texrects, plus what scissor rectangle is active.
-        void setOtherModeH_logged(State *state, DisplayList **dl) {
-            static int s_count = 0;
-            if (gbi_log_enabled() && (++s_count <= 4)) {
-                std::fprintf(stderr,
-                    "[gbi-f5] setOtherModeH #%d shift=%u length=%u w1=0x%08X\n",
-                    s_count, (*dl)->p0(8, 8), (*dl)->p0(0, 8), (*dl)->w1);
-                std::fflush(stderr);
-            }
-            GBI_F3D::setOtherModeH(state, dl);
-        }
-
-        void setOtherModeL_logged(State *state, DisplayList **dl) {
-            static int s_count = 0;
-            if (gbi_log_enabled() && (++s_count <= 4)) {
-                std::fprintf(stderr,
-                    "[gbi-f5] setOtherModeL #%d shift=%u length=%u w1=0x%08X\n",
-                    s_count, (*dl)->p0(8, 8), (*dl)->p0(0, 8), (*dl)->w1);
-                std::fflush(stderr);
-            }
-            // Strip coverage-related otherModeL bits (AA_EN / CVG_X_ALPHA /
-            // ALPHA_CVG_SEL) — Factor 5's combiner outputs alpha=0, which
-            // combined with these bits makes RT64 discard pixels as zero-cvg.
-            static const uint32_t s_strip_mask = []() {
-                uint32_t mask = 0;
-                auto check = [&](const char* env, uint32_t bits) {
-                    const char* v = std::getenv(env);
-                    if (v && v[0] && v[0] != '0') mask |= bits;
-                };
-                check("ROGUESQ_HLE_NO_AA", 1u << 14);
-                check("ROGUESQ_HLE_NO_CVGA", (1u << 23) | (1u << 24));
-                check("ROGUESQ_HLE_FORCE_OPAQUE",
-                      (1u << 14) | (1u << 23) | (1u << 24));
-                return mask;
-            }();
-            if (s_strip_mask) {
-                const uint32_t shift = (*dl)->p0(8, 8);
-                const uint32_t length = (*dl)->p0(0, 8);
-                // setOtherModeL writes `length+1` bits at position `shift`.
-                // Only mask bits this write actually covers.
-                const uint32_t bitsCovered =
-                    ((length + 1 >= 32) ? 0xFFFFFFFFu
-                                        : ((1u << (length + 1)) - 1)) << shift;
-                (*dl)->w1 &= ~(s_strip_mask & bitsCovered);
-            }
-            GBI_F3D::setOtherModeL(state, dl);
-        }
-
-        void setRDPOtherMode_logged(State *state, DisplayList **dl) {
-            static int s_count = 0;
-            if (gbi_log_enabled() && (++s_count <= 4)) {
-                std::fprintf(stderr,
-                    "[gbi-f5] setRDPOtherMode #%d w0=0x%08X w1=0x%08X\n",
-                    s_count, (*dl)->w0, (*dl)->w1);
-                std::fflush(stderr);
-            }
-            GBI_RDP::setOtherMode(state, dl);
-        }
-
-        void setScissor_logged(State *state, DisplayList **dl) {
-            static int s_count = 0;
-            if (gbi_log_enabled() && (++s_count <= 4)) {
-                std::fprintf(stderr,
-                    "[gbi-f5] setScissor #%d ulx=%u uly=%u lrx=%u lry=%u mode=%u\n",
-                    s_count,
-                    (*dl)->p0(12, 12), (*dl)->p0(0, 12),
-                    (*dl)->p1(12, 12), (*dl)->p1(0, 12),
-                    (*dl)->p1(24, 2));
-                std::fflush(stderr);
-            }
-            GBI_RDP::setScissor(state, dl);
-        }
-
-        // setTile + setCombine logging. Pure pass-through; we just want to
-        // see what tile setup and combiner configs Factor 5 is establishing
-        // before the texrects fire on tile 0.
-        void setTile_logged(State *state, DisplayList **dl) {
-            static int s_count = 0;
-            if (gbi_log_enabled() && (++s_count <= 12)) {
-                const uint8_t tile = (*dl)->p1(24, 3);
-                const uint8_t fmt = (*dl)->p0(21, 3);
-                const uint8_t siz = (*dl)->p0(19, 2);
-                const uint16_t line = (*dl)->p0(9, 9);
-                const uint16_t tmem = (*dl)->p0(0, 9);
-                const uint8_t palette = (*dl)->p1(20, 4);
-                std::fprintf(stderr,
-                    "[gbi-f5] setTile #%d tile=%u fmt=%u siz=%u line=%u tmem=%u palette=%u\n",
-                    s_count, tile, fmt, siz, line, tmem, palette);
-                std::fflush(stderr);
-            }
-            GBI_RDP::setTile(state, dl);
-        }
-
-        // FORCED_COMB_W0/W1 moved earlier (see file top).
-
-        void setCombine_logged(State *state, DisplayList **dl) {
-            // Track every distinct (w0, w1) pair the game emits for setCombine.
-            // First 8 calls also get logged unconditionally so we can see
-            // chronology. ROGUESQ_LOG_GBI=1 enables.
-            if (gbi_log_enabled()) {
-                static std::unordered_set<uint64_t> s_seen;
-                static int s_count = 0;
-                const uint64_t key = (uint64_t((*dl)->w0) << 32) | uint64_t((*dl)->w1);
-                const bool firstSeen = s_seen.insert(key).second;
-                if (++s_count <= 8 || firstSeen) {
-                    std::fprintf(stderr,
-                        "[gbi-f5] setCombine #%d%s w0=0x%08X w1=0x%08X\n",
-                        s_count, firstSeen ? " (NEW)" : "",
-                        (*dl)->w0, (*dl)->w1);
-                    std::fflush(stderr);
-                }
-            }
-            // Force solid-prim combiner under ROGUESQ_HLE_FORCE_VISIBLE.
-            if (force_visible_enabled()) {
-                state->rdp->setCombine(
-                    (uint64_t(FORCED_COMB_W1) << 32) | uint64_t(FORCED_COMB_W0));
-                // Also force prim color to magenta opaque so the combiner
-                // produces visible pixels.
-                state->rdp->setPrimColor(0, 0xFF, 0xFF00FFFFu);
-                return;
-            }
-
-            // ROGUESQ_HLE_FORCE_COMB — like FORCE_VISIBLE but does NOT
-            // bypass texrects to fillRects. Keeps the texrect dispatch
-            // path intact, only swaps the combiner to constant-white.
-            // Use to test: do texrects produce visible pixels when the
-            // combiner output is forced to white (i.e. sampling+blender
-            // pipeline works), vs. is something else upstream killing
-            // them? If white pixels appear at attribution glyph
-            // positions, the original combiner (or its texture
-            // sampling) is the bug. If still black, the texrect
-            // dispatch path itself drops the work.
-            static bool s_force_comb = []() {
-                const char* v = std::getenv("ROGUESQ_HLE_FORCE_COMB");
-                return v && v[0] && v[0] != '0';
-            }();
-            if (s_force_comb) {
-                state->rdp->setCombine(
-                    (uint64_t(FORCED_COMB_W1) << 32) | uint64_t(FORCED_COMB_W0));
-                state->rdp->setPrimColor(0, 0xFF, 0xFFFFFFFFu);
-                return;
-            }
-
-            // ROGUESQ_HLE_FORCE_PRIM_OUTPUT — port of the LLE-era
-            // PARTICLE_VISIBLE_DEBUG fix (reverted commit e718774 in lib/rt64).
-            // For the cinematic-text mux family (0xFC11FE23 and variants —
-            // attribution glyphs + N64 logo + explosion sprites), rewrite
-            // both color and alpha cycle 1 D fields to force output =
-            // PRIMITIVE color, alpha = ONE. Bypasses texture sampling
-            // entirely so we can distinguish "pipeline works, sampling
-            // broken" from "deeper bug".
-            //
-            //   color D cycle 1 (H bits 17-15) ← 3 (C_PRIMITIVE)
-            //   alpha D cycle 1 (H bits 11-9)  ← 6 (A_ONE)
-            //   (also rewrite cycle 2 D bits for 2-cycle muxes)
-            //
-            // Default off; set ROGUESQ_HLE_FORCE_PRIM_OUTPUT=1 to enable.
-            // If attribution shows prim-colored shapes where text should
-            // be, the gap is in texture sampling. If still black, the
-            // gap is in the blender/render-target pipeline.
-            static bool s_force_prim = []() {
-                const char* v = std::getenv("ROGUESQ_HLE_FORCE_PRIM_OUTPUT");
-                return v && v[0] && v[0] != '0';
-            }();
-            if (s_force_prim) {
-                const uint32_t w0 = (*dl)->w0;
-                const uint32_t w1 = (*dl)->w1;
-                const uint32_t lowL = w0;
-                const bool is_cinematic_mux =
-                    (lowL == 0xFC11FE23u) || (lowL == 0xFC11E623u) ||
-                    (lowL == 0xFC119623u) || (lowL == 0xFC127FFFu) ||
-                    (lowL == 0xFC127E24u);
-                if (is_cinematic_mux) {
-                    // Rewrite H bits to force PRIMITIVE color + ONE alpha output.
-                    uint32_t patched_w1 = w1;
-                    patched_w1 = (patched_w1 & ~(0x7u << 15)) | (3u << 15); // color D c1
-                    patched_w1 = (patched_w1 & ~(0x7u << 6 )) | (3u << 6 ); // color D c2
-                    patched_w1 = (patched_w1 & ~(0x7u << 9 )) | (6u << 9 ); // alpha D c1
-                    patched_w1 = (patched_w1 & ~(0x7u << 0 )) | (6u << 0 ); // alpha D c2
-                    if (gbi_log_enabled()) {
-                        static int s_n = 0;
-                        if (++s_n <= 4) {
-                            std::fprintf(stderr,
-                                "[gbi-f5] force-prim rewrite w0=0x%08X w1=0x%08X -> w1=0x%08X\n",
-                                w0, w1, patched_w1);
-                            std::fflush(stderr);
-                        }
-                    }
-                    // Force prim color to a bright known value so the
-                    // forced-prim output is unmistakable on screen.
-                    state->rdp->setPrimColor(0, 0xFF, 0x00FFFFFFu); // bright cyan
-                    state->rdp->setCombine(
-                        (uint64_t(patched_w1) << 32) | uint64_t(w0));
-                    return;
-                }
-            }
-
-            // Factor 5 alpha-all-zero patch (2026-05-13).
-            //
-            // Attribution-screen DLs emit setCombine with alpha cycle-1 fields
-            // A/B/C/D all encoding index 7. SDK only defines index 7 for the
-            // C field (G_ACMUX_0); for A/B/D it's an "uninitialized" value
-            // RT64 maps to A_ZERO via the alphaInputABD default case. Combined
-            // with the rendermode whose blender A_M1 sources CC alpha
-            // (G_BL_A_IN), the result is alpha=0 and every pixel multiplies
-            // by 0 in the blender → pure black output.
-            //
-            // We detect the all-7s pattern and rewrite the D field to index 6
-            // (= A_ONE for alphaInputABD). New alpha equation:
-            //   (A - B) * C + D = (0 - 0) * 0 + 1 = 1
-            // The blender sees alpha=1, color reaches the framebuffer.
-            //
-            // Gated default-on; disable with ROGUESQ_HLE_PATCH_ALPHA=0 if it
-            // breaks anything (e.g. legitimate fully-transparent draws).
-            static bool s_patch_enabled = []() {
-                const char* v = std::getenv("ROGUESQ_HLE_PATCH_ALPHA");
-                return !(v && v[0] == '0');  // default on
-            }();
-
-            uint32_t w0 = (*dl)->w0;
-            uint32_t w1 = (*dl)->w1;
-            if (s_patch_enabled) {
-                const uint32_t alphaA = (w0 >> 12) & 0x7;
-                const uint32_t alphaB = (w1 >> 12) & 0x7;
-                const uint32_t alphaC = (w0 >>  9) & 0x7;
-                const uint32_t alphaD = (w1 >>  9) & 0x7;
-                if (alphaA == 7 && alphaB == 7 && alphaC == 7 && alphaD == 7) {
-                    const uint32_t patched_w1 = (w1 & ~(0x7u << 9)) | (0x6u << 9);
-                    static int s_patched = 0;
-                    if (gbi_log_enabled() && (++s_patched <= 4)) {
-                        std::fprintf(stderr,
-                            "[gbi-f5] alpha-patch setCombine w0=0x%08X w1=0x%08X -> w1=0x%08X (force alpha=1)\n",
-                            w0, w1, patched_w1);
-                        std::fflush(stderr);
-                    }
-                    state->rdp->setCombine(
-                        (uint64_t(patched_w1) << 32) | uint64_t(w0));
-                    return;
-                }
-            }
-
-            GBI_RDP::setCombine(state, dl);
-        }
-
-        // Texrect guard. RT64 asserts in State::loadDrawState (rt64_state.cpp:262)
-        // when cycleType==G_CYC_COPY but the bound tile is undefined (line==0).
-        // The post-assert path treats it as `valid=false` and falls through, so
-        // the safe move is to skip the draw entirely when this combination
-        // would trip the assert.
-        static bool texrect_copy_undefined_tile(State *state, DisplayList **dl) {
-            const uint8_t tile = (*dl)[0].p1(24, 3);
-            if (state->rdp->otherMode.cycleType() == G_CYC_COPY &&
-                state->rdp->tiles[tile & 7].line == 0) {
-                static int s_skipped = 0;
-                if (gbi_log_enabled() && (++s_skipped <= 4)) {
-                    std::fprintf(stderr,
-                        "[gbi-f5] skip texrect: copy mode w/ undefined tile=%u\n",
-                        tile);
-                    std::fflush(stderr);
-                }
-                return true;
-            }
-            return false;
-        }
-
-        // fullSync (op 0xE9) tracker — Factor 5 may emit fullSync mid-DL,
-        // which would advance the workload cursor and be why our post-DL
-        // probe reads an empty workload (the populated one already moved).
-        void fullSync_logged(State *state, DisplayList **dl) {
-            static int s_count = 0;
-            if (gbi_log_enabled() && (++s_count <= 8)) {
-                std::fprintf(stderr,
-                    "[gbi-f5] fullSync #%d (dl-emitted) w0=0x%08X w1=0x%08X\n",
-                    s_count, (*dl)->w0, (*dl)->w1);
-                std::fflush(stderr);
-            }
-            GBI_RDP::fullSync(state, dl);
-        }
-
-        // setFillColor_overridden moved earlier (see file top).
-
-        // fillRect (op 0xF6) — solid color fills. Logs draw geometry.
-        void fillRect_logged(State *state, DisplayList **dl) {
-            static int s_count = 0;
-            if (gbi_log_enabled() && (++s_count <= 8)) {
-                std::fprintf(stderr,
-                    "[gbi-f5] fillRect #%d ulx=%u uly=%u lrx=%u lry=%u\n",
-                    s_count,
-                    (*dl)->p1(12, 12), (*dl)->p1(0, 12),
-                    (*dl)->p0(12, 12), (*dl)->p0(0, 12));
-                std::fflush(stderr);
-            }
-            GBI_RDP::fillRect(state, dl);
-        }
-
-        void texrectLLE_guarded(State *state, DisplayList **dl) {
-            if (texrect_copy_undefined_tile(state, dl)) {
-                (*dl)++;  // skip the 8-byte texcoord follow-up to keep dispatch aligned
-                return;
-            }
-            // Track per-active-CIMG-address texrect counts to see which fbs
-            // actually receive draws. ROGUESQ_LOG_CIMG=1 enables.
-            {
-                static std::unordered_map<uint32_t, uint32_t> s_drawsPerFb;
-                static int s_total = 0;
-                static bool s_log = []() {
-                    const char* v = std::getenv("ROGUESQ_LOG_CIMG");
-                    return v && v[0] && v[0] != '0';
-                }();
-                if (s_log) {
-                    s_drawsPerFb[state->rdp->colorImage.address]++;
-                    if ((++s_total & 0x3F) == 0) {
-                        std::fprintf(stderr, "[gbi-f5] texrect-per-fb (total=%d):", s_total);
-                        for (const auto& kv : s_drawsPerFb) {
-                            std::fprintf(stderr, " 0x%06X=%u", kv.first, kv.second);
-                        }
-                        std::fprintf(stderr, "\n");
-                        std::fflush(stderr);
-                    }
-                }
-            }
-            // Track distinct (colorImg, combL, combH) at texrect time. This
-            // shows which combiner Factor 5 ACTUALLY uses to render to each
-            // fb (not the stale initial setup). ROGUESQ_LOG_GBI=1.
-            if (gbi_log_enabled()) {
-                struct Key { uint32_t fb, l, h; bool operator==(const Key& o) const { return fb==o.fb && l==o.l && h==o.h; } };
-                struct KeyHash { size_t operator()(const Key& k) const { return std::hash<uint64_t>()((uint64_t(k.fb) << 32) ^ (uint64_t(k.l) << 16) ^ uint64_t(k.h)); } };
-                static std::unordered_set<Key, KeyHash> s_seen;
-                const auto& comb = state->rdp->colorCombinerStack[state->rdp->colorCombinerStackSize - 1];
-                Key k{state->rdp->colorImage.address, comb.L, comb.H};
-                if (s_seen.insert(k).second) {
-                    std::fprintf(stderr,
-                        "[gbi-f5] texrect-uses fb=0x%06X combL=0x%08X combH=0x%08X otherL=0x%08X\n",
-                        k.fb, k.l, k.h, state->rdp->otherMode.L);
-                    std::fflush(stderr);
-                }
-            }
-            static int s_count = 0;
-            int n = ++s_count;
-            if (gbi_log_enabled() && n <= 4) {
-                // Log the per-texrect render state so we can see whether
-                // RT64 receives well-formed inputs:
-                //   - colorImage: where the draw is targeted
-                //   - prim/env/fill color: combiner inputs
-                //   - combiner mux: how alpha is computed
-                //   - othermode L: blend / cycle / coverage / alpha bits
-                const auto& prim = state->rdp->primColorStack[state->rdp->primColorStackSize - 1];
-                const auto& env = state->rdp->envColorStack[state->rdp->envColorStackSize - 1];
-                const uint32_t fillRaw = state->rdp->fillColorStack[state->rdp->fillColorStackSize - 1];
-                const auto& comb = state->rdp->colorCombinerStack[state->rdp->colorCombinerStackSize - 1];
-                std::fprintf(stderr,
-                    "[gbi-f5] texrect #%d colorImg=0x%06X "
-                    "prim=(%.2f %.2f %.2f %.2f) env=(%.2f %.2f %.2f %.2f) fillRaw=0x%08X "
-                    "combL=0x%08X combH=0x%08X otherL=0x%08X otherH=0x%08X\n",
-                    n,
-                    state->rdp->colorImage.address,
-                    (float)prim.x, (float)prim.y, (float)prim.z, (float)prim.w,
-                    (float)env.x, (float)env.y, (float)env.z, (float)env.w,
-                    fillRaw,
-                    comb.L, comb.H,
-                    state->rdp->otherMode.L,
-                    state->rdp->otherMode.H);
-                std::fflush(stderr);
-            }
-            // ROGUESQ_HLE_FORCE_FILLRECT — convert every texrect into a
-            // fillRect at the same coords. Pure existence test: if magenta
-            // appears, RT64 IS presenting; just our texrect path is wrong.
-            if (force_visible_enabled()) {
-                state->rdp->setFillColor(0xF80FF80F);  // RGBA5551 magenta opaque
-                // Use the original texrect bounds. drawTexRect cycles to
-                // 1cycle and emits 2 tris. Force-fillRect is simpler: just
-                // call drawRect bypassing texture sampling.
-                int32_t ulx = (*dl)[0].p1(12, 12);
-                int32_t uly = (*dl)[0].p1(0, 12);
-                int32_t lrx = (*dl)[0].p0(12, 12);
-                int32_t lry = (*dl)[0].p0(0, 12);
-                state->rdp->fillRect(ulx, uly, lrx, lry);
-                (*dl)++;  // consume the LLE texrect follow-up word
-                return;
-            }
-            GBI_RDP::texrectLLE(state, dl);
-        }
-
-        void texrectFlipLLE_guarded(State *state, DisplayList **dl) {
-            if (texrect_copy_undefined_tile(state, dl)) {
-                (*dl)++;
-                return;
-            }
-            GBI_RDP::texrectFlipLLE(state, dl);
-        }
-
-        // loadTLUT / loadTile / loadBlock guards.
-        //
-        // Replays in RDP::loadTLUTOperation / loadTileOperation compute
-        // rowCount = ((lrt >> 2) - (ult >> 2)) + 1, wordsPerRow similarly. If
-        // lr < ul, the subtraction underflows uint32_t and the inner loop
-        // reads gigabytes past the texture base → AV.
-        //
-        // Original strategy: reject the load entirely. That kept us crash-free
-        // but also threw out real texture loads (Factor 5 emits valid lr/ul
-        // values that look superficially like the bogus ones), leaving tile 0
-        // with empty TMEM → texrects sample black → black screen.
-        //
-        // New strategy: CLAMP. Swap lr/ul if inverted; cap region size.
-        // Real loads land with intact bounds, opcode-reuse cases get a
-        // minimal degenerate load that stores tile metadata but reads ~no
-        // RDRAM. We do this by calling state->rdp->loadXxx directly with
-        // clamped values rather than delegating to GBI_RDP which would
-        // re-parse from the raw DL bytes.
-
-        // Returns true if the load is so absurd we drop it; otherwise fills
-        // out *uls/*ult/*lrs/*lrt clamped to a safe region (≤256x256 texels).
-        static bool clamp_load_subscripts(const DisplayList *dl,
-                                          uint16_t *uls_out, uint16_t *ult_out,
-                                          uint16_t *lrs_out, uint16_t *lrt_out) {
-            uint16_t uls = dl->p0(12, 12);
-            uint16_t ult = dl->p0(0, 12);
-            uint16_t lrs = dl->p1(12, 12);
-            uint16_t lrt = dl->p1(0, 12);
-            // Swap inverted bounds rather than dropping: if Factor 5 emits a
-            // backwards range, treating it forward gives us *some* texels.
-            if (lrs < uls) std::swap(uls, lrs);
-            if (lrt < ult) std::swap(ult, lrt);
-            // Cap span to 1024 (256 texels in 10.2 fixed-point) to keep load
-            // size bounded.
-            const uint16_t MaxSpan = 1024;
-            if (lrs - uls > MaxSpan) lrs = uls + MaxSpan;
-            if (lrt - ult > MaxSpan) lrt = ult + MaxSpan;
-            *uls_out = uls;
-            *ult_out = ult;
-            *lrs_out = lrs;
-            *lrt_out = lrt;
-            return false;
-        }
-
-        void loadTLUT_guarded(State *state, DisplayList **dl) {
-            const uint8_t tile = (*dl)->p1(24, 3);
-            uint16_t uls, ult, lrs, lrt;
-            clamp_load_subscripts(*dl, &uls, &ult, &lrs, &lrt);
-            static int s_count = 0;
-            if (gbi_log_enabled() && (++s_count <= 8)) {
-                std::fprintf(stderr,
-                    "[gbi-f5] loadTLUT #%d tile=%u uls=%u ult=%u lrs=%u lrt=%u (raw w0=0x%08X w1=0x%08X)\n",
-                    s_count, tile, uls, ult, lrs, lrt, (*dl)->w0, (*dl)->w1);
-                std::fflush(stderr);
-            }
-            state->rdp->loadTLUT(tile, uls, ult, lrs, lrt);
-        }
-
-        void loadTile_guarded(State *state, DisplayList **dl) {
-            const uint8_t tile = (*dl)->p1(24, 3);
-            uint16_t uls, ult, lrs, lrt;
-            clamp_load_subscripts(*dl, &uls, &ult, &lrs, &lrt);
-            static int s_count = 0;
-            if (gbi_log_enabled() && (++s_count <= 8)) {
-                std::fprintf(stderr,
-                    "[gbi-f5] loadTile #%d tile=%u uls=%u ult=%u lrs=%u lrt=%u\n",
-                    s_count, tile, uls, ult, lrs, lrt);
-                std::fflush(stderr);
-            }
-            state->rdp->loadTile(tile, uls, ult, lrs, lrt);
-        }
-
-        void loadBlock_guarded(State *state, DisplayList **dl) {
-            // loadBlock has different fields: uls/ult are texture origin,
-            // lrs is endpoint, dxt is row stride.
-            const uint8_t tile = (*dl)->p1(24, 3);
-            uint16_t uls = (*dl)->p0(12, 12);
-            uint16_t ult = (*dl)->p0(0, 12);
-            uint16_t lrs = (*dl)->p1(12, 12);
-            const uint16_t dxt = (*dl)->p1(0, 12);
-            if (lrs < uls) std::swap(uls, lrs);
-            // Cap the block size at 2048 texels (max valid in 12-bit field).
-            if (lrs - uls > 2048) lrs = uls + 2048;
-            static int s_count = 0;
-            if (gbi_log_enabled() && (++s_count <= 8)) {
-                std::fprintf(stderr,
-                    "[gbi-f5] loadBlock #%d tile=%u uls=%u ult=%u lrs=%u dxt=%u\n",
-                    s_count, tile, uls, ult, lrs, dxt);
-                std::fflush(stderr);
-            }
-            state->rdp->loadBlock(tile, uls, ult, lrs, dxt);
-        }
-
-        // setTextureImage filter. Factor 5 sometimes emits SET_TEXTURE_IMAGE
-        // (op 0xFD) with payload bytes that are not a valid RDRAM address —
-        // anything from KSEG1-flagged pointers to outright garbage. The
-        // address gets stored in RDP::texture.address, then the next loadTile
-        // / loadBlock / loadTLUT reads `RDRAM[address + offset]` and AVs.
-        //
-        // RT64 already masks via RDP::maskAddress (& 0xFFFFFF), so anything
-        // above 16MB is folded down. The 8MB game RDRAM may be even smaller
-        // (4MB without ExpansionPak), but we accept up to 16MB conservatively.
-        // Reject when the masked address is zero (no real texture lives there)
-        // or when w1 has the high garbage-marker bits set (e.g. all-ones).
-        void setTextureImage_filtered(State *state, DisplayList **dl) {
-            const uint32_t w1 = (*dl)->w1;
-            // All-ones / mostly-ones is a known Factor 5 garbage pattern.
-            if (w1 == 0xFFFFFFFFu) return;
-            // After RDP::maskAddress folds KSEG bits, address < 0x1000 is
-            // almost certainly bogus (low RDRAM is libultra/PIF area).
-            const uint32_t masked = w1 & 0x00FFFFFFu;
-            if (masked < 0x1000u) return;
-            // Track distinct SETTIMG source addresses to find missing fb-as-
-            // texture composite ops (e.g. hi-res scratch → lo-res VI fb).
-            if (gbi_log_enabled()) {
-                static std::unordered_map<uint32_t, uint32_t> s_seen;
-                const uint32_t count = ++s_seen[w1];
-                if (count == 1 || count == 8 || (count & 0xFF) == 0) {
-                    std::fprintf(stderr,
-                        "[gbi-f5] setTextureImage addr=0x%08X count=%u w0=0x%08X\n",
-                        w1, count, (*dl)->w0);
-                    std::fflush(stderr);
-                    // Dump 32 bytes of texture source data to check for
-                    // all-zero (asset never loaded) vs. real content.
-                    if (count == 1) {
-                        const uint32_t phys = w1 & 0x00FFFFFFu;
-                        if (phys < 0x800000u) {
-                            uint8_t* rdram = state->fromRDRAM(0);
-                            if (rdram != nullptr) {
-                                std::fprintf(stderr, "  bytes:");
-                                int nonzero = 0;
-                                for (int i = 0; i < 32; ++i) {
-                                    uint8_t b = rdram[(phys + i) ^ 3];
-                                    std::fprintf(stderr, " %02X", b);
-                                    if (b) nonzero++;
-                                }
-                                std::fprintf(stderr, "  (nonzero=%d/32)\n", nonzero);
-                                std::fflush(stderr);
-                            }
-                        }
-                    }
-                }
-            }
-            GBI_RDP::setTextureImage(state, dl);
-        }
-
-        void setColorImage_filtered(State *state, DisplayList **dl) {
-            const uint32_t w0 = (*dl)->w0;
-            const uint32_t w1 = (*dl)->w1;
-            if (w1 == 0) return;
-            const uint32_t fmt = (w0 >> 21) & 0x7;
-            const uint32_t siz = (w0 >> 19) & 0x3;
-            if (fmt > 4) return;
-
-            // Per-address accept counter. Periodically dumps a table of
-            // every legit-shaped setCIMG address and how many times it was
-            // emitted. Helps see whether VI's sampled fb actually gets
-            // setCIMG'd at all (presence) and how often vs. scratch fbs
-            // (frequency). ROGUESQ_LOG_CIMG=1 to enable.
-            {
-                static std::unordered_map<uint32_t, uint32_t> s_counts;
-                static int s_total = 0;
-                static bool s_log = []() {
-                    const char* v = std::getenv("ROGUESQ_LOG_CIMG");
-                    return v && v[0] && v[0] != '0';
-                }();
-                if (s_log) {
-                    s_counts[w1]++;
-                    if ((++s_total & 0x3FF) == 0) {
-                        std::fprintf(stderr, "[gbi-f5] setCIMG counts (total=%d):", s_total);
-                        for (const auto& kv : s_counts) {
-                            std::fprintf(stderr, " 0x%08X=%u", kv.first, kv.second);
-                        }
-                        std::fprintf(stderr, "\n");
-                        std::fflush(stderr);
-                    }
-                }
-            }
-
-            // Reject combinations that crash NativeTarget::resolveFromRDRAM's
-            // readback asserts (rt64_native_target.cpp:167-176). Supported:
-            // RGBA16/RGBA32, CI8, I8, DEPTH16. Everything else aborts.
-            const bool unsupported =
-                (siz == 0 /* 4b */) ||
-                (fmt == G_IM_FMT_RGBA && siz == G_IM_SIZ_8b) ||
-                (fmt == G_IM_FMT_IA) ||
-                (fmt == G_IM_FMT_CI && siz != G_IM_SIZ_8b) ||
-                (fmt == G_IM_FMT_I && siz != G_IM_SIZ_8b);
-            if (unsupported) {
-                if (gbi_log_enabled()) {
-                    std::fprintf(stderr,
-                        "[gbi-f5] setCIMG reject fmt=%u siz=%u w0=0x%08X w1=0x%08X\n",
-                        fmt, siz, w0, w1);
-                    std::fflush(stderr);
-                }
-                return;
-            }
-
-            GBI_F3D::setColorImage(state, dl);
-
-            // After setColorImage, log the final CIMG width/fmt/siz for the
-            // VI-sampled buffer addrs so we can verify they match VI's
-            // expectations (needed for PresentEarly matcher).
-            {
-                static bool s_log = []() {
-                    const char* v = std::getenv("ROGUESQ_LOG_CIMG");
-                    return v && v[0] && v[0] != '0';
-                }();
-                if (s_log) {
-                    const uint32_t addr = state->rdp->colorImage.address;
-                    if (addr == 0x62B800 || addr == 0x695C00 || addr == 0x795C00) {
-                        static std::unordered_map<uint64_t, uint32_t> s_seenDims;
-                        uint64_t key = (uint64_t(addr) << 32) |
-                                       (uint64_t(state->rdp->colorImage.width) << 16) |
-                                       (uint64_t(state->rdp->colorImage.fmt) << 8) |
-                                       uint64_t(state->rdp->colorImage.siz);
-                        if (s_seenDims.insert({key, 1}).second) {
-                            std::fprintf(stderr,
-                                "[gbi-f5] visFb-CIMG addr=0x%06X width=%u fmt=%u siz=%u\n",
-                                addr, state->rdp->colorImage.width,
-                                state->rdp->colorImage.fmt, state->rdp->colorImage.siz);
-                            std::fflush(stderr);
-                        }
-                    }
-                }
-            }
-        }
-
-        void setup(GBI *gbi) {
-            // Inherit all F3DEX defaults first, then override the opcodes
-            // Factor 5 reuses for its own meanings.
+        // ---------------------------------------------------------------- setup
+        void setup(GBI* gbi) {
             GBI_F3DEX::setup(gbi);
 
-            // 0x01/0x02/0x03: Factor 5's custom asset-load + vertex-transform
-            //       + triangle-emit family. Decoded from RSP ucode at IMEM
-            //       0x14F0 (op 0x02), 0x1504 (op 0x01 falls into shared
-            //       body), 0x14D4 (op 0x03 prefix). When experimental
-            //       handlers are enabled, route them to op_*_experimental;
-            //       otherwise keep the original no-ops + permissive 0x03.
-            //       See project_attribution_op02_breakthrough_2026_05_13.md.
-            if (op02_experimental_enabled()) {
-                gbi->map[0x01] = &op_01_experimental;
-                gbi->map[0x02] = &op_02_experimental;
-                gbi->map[0x03] = &op_03_experimental;
-            } else {
-                gbi->map[0x02] = &op_noop;
-                // 0x03: G_MOVEMEM. Factor 5 emits subcodes outside F3D's
-                //       standard set. Use a permissive variant that no-ops
-                //       unknown subcodes (with optional log) instead of
-                //       asserting.
-                gbi->map[F3D_G_MOVEMEM] = &moveMem_permissive;
+            // Factor 5 geometry stream.
+            gbi->map[0x01] = &op_01_matrix;
+            gbi->map[0x02] = &op_02_colors;
+            gbi->map[0x03] = &op_03_f5;
+            gbi->map[0x04] = &op_04_vertex;
+            gbi->map[0x14] = &op_consume16;    // 16-byte state command (not a vertex batch)
+            gbi->map[0x13] = &op_13_quad;
+            gbi->map[0xBF] = &op_bf_tri;
+            gbi->map[0xB4] = &op_b4_quad;
+            gbi->map[0xBB] = &texture_f5;
+
+            // Flow.
+            gbi->map[0x06] = &op_06_strict_dl;
+            gbi->map[0x80] = &op_80_header;
+            gbi->map[0xB5] = &op_b5_next_chunk;
+            gbi->map[0x07] = &op_07_branch;
+            {
+                static bool s_op05 = env_on("ROGUESQ_F5_OP05_32", true);
+                if (s_op05) gbi->map[0x05] = &op_05_record;
             }
 
-            // 0x06: G_DL — but Factor 5 reuses byte 0x06 for non-DL purposes.
-            //       Strict filter delegates only when payload looks like a real
-            //       G_DL (no extra payload bits set).
-            gbi->map[0x06] = &op_06_strict_dl;
+            // Ucode dispatch-table aliases (DMEM 0xD6 table): low opcodes 0x08..0x12 run the
+            // same handlers as 0xBF..0xB5 (0x0C = G_TEXTURE follows every 0x05 sprite record).
+            gbi->map[0x08] = &op_bf_tri;
+            gbi->map[0x09] = &op_consume16;      // BE
+            gbi->map[0x0A] = &op_consume16;      // BD
+            gbi->map[0x0B] = gbi->map[0xBC];     // moveword
+            gbi->map[0x0C] = &texture_f5;        // BB
+            gbi->map[0x0D] = gbi->map[0xBA];
+            gbi->map[0x0E] = gbi->map[0xB9];
+            gbi->map[0x0F] = gbi->map[0xB8];     // endDl
+            gbi->map[0x10] = gbi->map[0xB7];
+            gbi->map[0x11] = gbi->map[0xB6];
+            gbi->map[0x12] = &op_b5_next_chunk;
 
-            // 0x80: Factor 5 chunk header (metadata, no-op for HLE).
-            gbi->map[0x80] = &op_noop;
-
-            // 0xB0: F3DEX G_BRANCH_Z. Factor 5 emits packed data here that
-            //       crashes the inherited handler's vertex-cache index check.
-            gbi->map[0xB0] = &op_noop;
-
-            // 0xB2: F3DEX G_MODIFYVTX. Factor 5's payload yields out-of-range
-            //       vertex indices that trip the RSP::modifyVertex assert
-            //       ("Vertex index is not valid. DL is possibly corrupted").
-            //       Same opcode-reuse pattern as 0xB0/0xB5 — no-op for HLE.
-            gbi->map[0xB2] = &op_noop;
-
-            // 0xAF: F3DEX G_LOAD_UCODE. The inherited handler hashes whatever
-            //       bytes the args point at and crashes when the lookup misses
-            //       (hleGBI becomes nullptr → next opcode dereferences null).
-            //       Factor 5 is monolithic — it never legitimately swaps to a
-            //       child ucode mid-DL; treat any 0xAF as opcode reuse and
-            //       no-op so the registered F3DFACTOR5 GBI stays selected.
+            // Reused F3DEX bytes that carry Factor 5 data.
+            gbi->map[0xB0] = &op_noop;   // F3DEX branch_z: packed data here
+            gbi->map[0xB2] = &op_noop;   // F3DEX modify_vtx
             gbi->map[0xAF] = &op_noop;
+            gbi->map[0xEF] = &op_noop;
+            {
+                static bool s_bdbe = env_on("ROGUESQ_F5_BDBE", true);
+                static bool s_be16 = env_on("ROGUESQ_F5_BE16", true);
+                if (s_bdbe) {
+                    gbi->map[0xBD] = s_be16 ? &op_consume16 : &op_noop;
+                    gbi->map[0xBE] = s_be16 ? &op_consume16 : &op_noop;
+                }
+            }
 
-            // 0xB4 / 0xBF: 16-byte payload commands. Consume the extra word.
-            //
-            // 2026-05-13 — Verified by user test (ROGUESQ_HLE_TRI_PASSTHROUGH=1)
-            // that letting F3DEX's standard 0xBF handler (G_TRI1) take over
-            // produces garbled graphics during N64 logo. So 0xBF in Factor 5's
-            // variant is NOT standard G_TRI1 — the original drift-detector
-            // diagnosis was correct. Keep as 16-byte consumer.
-            gbi->map[0xB4] = &op_consume16;
-            gbi->map[0xBF] = &op_consume16;
-
-            // 0xB5: Factor 5 chunk/DL terminator marker. Treated as no-op
-            //       since op 0xB8 (standard G_ENDDL, inherited from F3D)
-            //       is the real "return from DL".
-            gbi->map[0xB5] = &op_noop;
-
-            // 0xFC/0xF5: G_SETCOMBINE / G_SETTILE. Pass-through with logs
-            //       so we can see what tile + combiner state Factor 5 is
-            //       building up before texrects fire.
+            // RDP-state / raster wrappers (rt64_gbi_f5_rdpstate.cpp).
             gbi->map[0xFC] = &setCombine_logged;
             gbi->map[0xF5] = &setTile_logged;
-
-            // 0xE9: G_RDPFULLSYNC. Pass-through with log so we can see if
-            //       Factor 5 ever emits a fullSync mid-DL (which would
-            //       advance writeCursor and make our post-DL probe see
-            //       a fresh empty workload instead of the populated one).
-            gbi->map[0xE9] = &fullSync_logged;
-
-            // 0xF6: G_FILLRECT — solid-color rectangle. Use op02-aware
-            //       wrapper so that when ROGUESQ_HLE_OP02_EXPERIMENTAL=1
-            //       fires op_02 and that produces visible output, the
-            //       subsequent black-clear (fillColor=0x00010001) is
-            //       suppressed instead of wiping the experimental output.
-            //       Otherwise the wrapper just falls through to fillRect_logged.
             gbi->map[0xF6] = &fillRect_op02_aware;
-
-            // 0xF7: G_SETFILLCOLOR — override under ROGUESQ_HLE_FORCE_VISIBLE.
             gbi->map[0xF7] = &setFillColor_overridden;
-
-            // 0xB9/0xBA/0xED: setOtherMode L/H, setScissor. Pass-through
-            //       with logs so we can see what cycle/blend/scissor state
-            //       is active when texrects render. F3D-style setOtherMode
-            //       L/H is what Factor 5 uses for legitimate state changes.
             gbi->map[0xB9] = &setOtherModeL_logged;
             gbi->map[0xBA] = &setOtherModeH_logged;
             gbi->map[0xED] = &setScissor_logged;
-
-            // 0xEF: G_RDPSETOTHERMODE. Factor 5 reuses byte 0xEF for non-
-            //       command purposes (observed: pixel-pattern bytes like
-            //       w0=0xEFEFEFFF w1=0x515151FF). The inherited handler
-            //       forwards w0/w1 directly into RDP::setOtherMode which
-            //       then corrupts cycleType/rendermode/blender to all-ones,
-            //       making texrects render with broken combiner output and
-            //       producing the persistent black screen. F3D-style 0xB9/
-            //       0xBA setOtherMode L/H is the path Factor 5 uses for
-            //       real state changes; 0xEF is opcode reuse → no-op.
-            gbi->map[0xEF] = &op_noop;
-
-            // 0xFD: G_SETTIMG. Factor 5 sometimes emits 0xFFFFFFFF or
-            //       sub-1KB-offset addresses; reject those before they're
-            //       stored in RDP::texture and dereferenced by loadTile/TLUT.
             gbi->map[0xFD] = &setTextureImage_filtered;
-
-            // 0xF0/0xF3/0xF4: G_LOADTLUT, G_LOADBLOCK, G_LOADTILE. Reject
-            //       when subscripts would underflow / exceed reasonable size
-            //       (Factor 5 occasionally emits ops misparsed as loads with
-            //       lr < ul, which makes the deferred replay AV in RDRAM).
             gbi->map[0xF0] = &loadTLUT_guarded;
             gbi->map[0xF3] = &loadBlock_guarded;
             gbi->map[0xF4] = &loadTile_guarded;
-
-            // 0xFF: G_SETCIMG with Factor 5-specific filtering for bogus
-            //       payloads (w1=0 marker, invalid fmt fields).
             gbi->map[0xFF] = &setColorImage_filtered;
-
-            // 0xE4 / 0xE5: Factor 5 emits TEXRECTs in LLE format (16 bytes:
-            //       TEXRECT + one RDPHALF follow-up). The default F3DEX HLE
-            //       texrect handler reads 24 bytes and consumes the *next*
-            //       TEXRECT as garbage follow-up. Use LLE variants wrapped in
-            //       a copy-mode-undefined-tile guard (texrect_copy_undefined_tile)
-            //       so the assert in State::loadDrawState doesn't trip when
-            //       Factor 5 emits texrects against unconfigured tiles.
             gbi->map[0xE4] = &texrectLLE_guarded;
             gbi->map[0xE5] = &texrectFlipLLE_guarded;
-        }
 
-    }  // namespace GBI_F3DFACTOR5
-}  // namespace RT64
+            // Chunk-bounded fetch around every handler (must be last).
+            f5_install_bounded(gbi, std::make_integer_sequence<int, UCODE_MAP_SIZE>{});
+        }
+    }
+}

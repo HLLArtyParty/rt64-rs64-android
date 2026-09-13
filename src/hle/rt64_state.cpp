@@ -2,6 +2,7 @@
 // RT64
 //
 
+#include <unordered_set>
 #include "rt64_state.h"
 
 #include <cassert>
@@ -711,6 +712,23 @@ namespace RT64 {
 
                 uint64_t reinterpretHash = XXH3_64bits(&hashData, sizeof(hashData));
                 auto it = framebufferManager.reinterpretTileCache.find(reinterpretHash);
+                // Diagnostic (ROGUESQ_REINT_DIAG): per-run reinterpret flood composition —
+                // hits vs misses (=ops), distinct source tiles vs distinct full hashes, to see
+                // whether the flood is many distinct CI tiles or the same tiles re-converted.
+                {
+                    static int s_rd = -1;
+                    if (s_rd < 0) { const char *e = std::getenv("ROGUESQ_REINT_DIAG"); s_rd = (e && e[0] && e[0] != '0') ? 1 : 0; }
+                    if (s_rd) {
+                        static uint64_t hits = 0, misses = 0;
+                        static std::unordered_set<uint64_t> distinctSrc, distinctHash;
+                        if (it != framebufferManager.reinterpretTileCache.end()) ++hits; else ++misses;
+                        distinctSrc.insert(hashData.tmemHashOrID);
+                        distinctHash.insert(reinterpretHash);
+                        if (((hits + misses) & 8191) == 0)
+                            fprintf(stderr, "[reint] hits=%llu misses=%llu distinctSrc=%zu distinctHash=%zu\n",
+                                    (unsigned long long)hits, (unsigned long long)misses, distinctSrc.size(), distinctHash.size());
+                    }
+                }
                 if (it != framebufferManager.reinterpretTileCache.end()) {
                     callTile.tmemHashOrID = it->second;
                 }
@@ -1449,24 +1467,65 @@ namespace RT64 {
                 while (pairCursor < maxFramebufferPair) {
                     if (getFramebufferPairs(pairCursor)) {
                         // ROGUE-SQUADRON-RECOMP fix (load-bearing — see
+                        // memory/project_matpool_corruption_resolved_2026_05_20.md,
                         // memory/project_n64_logo_freeze_audio.md and
                         // memory/project_slash_literal_corruption.md): gate
-                        // RDRAM writeback on addressStart >= 0x100000.
+                        // RDRAM writeback on addressStart ∈ [0x400000, 0x800000).
+                        //
+                        // Original gate (2026-05-09): >= 0x100000 only.
                         // Factor 5 LLE ucode emits SET_COLOR_IMAGE with addrs
-                        // in the .text/.rodata region (~0x470, ~0x3CBxx) which
-                        // RT64 then dutifully scribbles framebuffer pixels
-                        // into, corrupting the game's static data and the "/"
-                        // string literal that find_manifest_entry depends on.
-                        // The proper long-term fix is in the LLE source so
-                        // RT64 sees the real fb address; until then this
-                        // 1MB gate is safe (real N64 framebuffers are always
-                        // at >=0x80100000) and unblocks Factor 5 boot.
-                        if (colorFb->addressStart >= 0x100000) {
-                            colorFb->copyNativeToRAM(&RDRAM[colorFb->addressStart], colorWriteWidth, colorRowStart, std::min(colorRowEnd, colorFb->height));
+                        // in the .text/.rodata region (~0x470, ~0x3CBxx)
+                        // which RT64 then dutifully scribbles framebuffer
+                        // pixels into, corrupting the "/" string literal.
+                        //
+                        // Tightened lower bound to 0x400000 (2026-05-20):
+                        // Factor 5 HLE cinematic ucode ALSO emits garbage
+                        // SET_COLOR_IMAGE in the heap region [0x100000,
+                        // 0x400000) — specifically 0xFF1410A6 (mask=0x1410A6)
+                        // overlaps the texture-material pool at 0x15FDE0,
+                        // and copyNativeToRAM blits framebuffer pixels over
+                        // the free-list, freezing the cinematic. The HLE
+                        // walker in src/main can't follow segment-mapped
+                        // G_DL sub-DLs so it misses this CIMG; this gate is
+                        // the only chokepoint that catches it regardless of
+                        // walker reach. Real game framebuffers all live at
+                        // >= 0x4B7800 (verified against PJ64 RDRAM dumps),
+                        // so 0x400000 is a safe lower bound.
+                        //
+                        // Added upper bound < 0x800000: garbage CIMGs at
+                        // addresses past 8 MB RDRAM cause copyNativeToRAM
+                        // to write past the RDRAM buffer into the host
+                        // recompile heap (adjacent in the same allocation),
+                        // corrupting a different game heap's free-list.
+                        constexpr uint32_t kFbMinAddr = 0x400000;
+                        constexpr uint32_t kFbMaxAddr = 0x800000;
+                        // RogueSquadron64Recomp (2026-09-08): a garbage registration (width 1 at 0x760000) had
+                        // its write-back land on the game's heap free list. Real buffers are >= 16 wide, 64-aligned.
+                        // Off by default (2026-09-08): any extra condition here blanked the display, so the
+                        // presentation path depends on these copies. Garbage registrations are stopped in the F5 filter.
+                        static const bool s_wbStrict = [](){ const char* e = std::getenv("ROGUESQ_RT64_WB_STRICT"); return e && e[0] && e[0] != '0'; }();
+                        // Width is not usable here (a width test blanked the display); alignment only. The
+                        // width-1 garbage registrations are rejected upstream in setColorImage_filtered.
+                        const bool colorFbPlausible = !s_wbStrict || (colorFb->addressStart & 0x3F) == 0;
+                        // ROGUESQ_LOG_WB=1: each distinct color write-back target once (address, width, rows).
+                        static const bool s_wbLog = [](){ const char* e = std::getenv("ROGUESQ_LOG_WB"); return e && e[0] && e[0] != '0'; }();
+                        if (s_wbLog) {
+                            static std::unordered_set<uint64_t> seen;
+                            const uint64_t key = ((uint64_t)colorFb->addressStart << 32) | ((uint64_t)colorWriteWidth << 16) | (uint64_t)std::min(colorRowEnd, colorFb->height);
+                            if (seen.insert(key).second) { fprintf(stderr, "[wb] color addr=0x%06X width=%u rows=%u..%u siz=%u\n", colorFb->addressStart, colorWriteWidth, colorRowStart, std::min(colorRowEnd, colorFb->height), colorFb->siz); fflush(stderr); }
+                        }
+                        if (colorFbPlausible && colorFb->addressStart >= kFbMinAddr && colorFb->addressStart < kFbMaxAddr) {
+                            colorFb->copyNativeToRAM(&(writeBackRDRAM ? writeBackRDRAM : RDRAM)[colorFb->addressStart], colorWriteWidth, colorRowStart, std::min(colorRowEnd, colorFb->height));
                         }
 
-                        if (depthWriteWidth > 0 && depthFb->addressStart >= 0x100000) {
-                            depthFb->copyNativeToRAM(&RDRAM[depthFb->addressStart], depthWriteWidth, depthRowStart, std::min(depthRowEnd, depthFb->height));
+                        if (s_wbLog && depthWriteWidth > 0) {
+                            static std::unordered_set<uint64_t> seenD;
+                            const uint64_t key = ((uint64_t)depthFb->addressStart << 32) | ((uint64_t)depthWriteWidth << 16) | (uint64_t)std::min(depthRowEnd, depthFb->height);
+                            if (seenD.insert(key).second) { fprintf(stderr, "[wb] depth addr=0x%06X width=%u rows=%u..%u" "\n", depthFb->addressStart, depthWriteWidth, depthRowStart, std::min(depthRowEnd, depthFb->height)); fflush(stderr); }
+                        }
+                        const bool depthFbPlausible = !s_wbStrict || (depthFb->addressStart & 0x3F) == 0;
+                        if (depthFbPlausible && depthWriteWidth > 0 && depthFb->addressStart >= kFbMinAddr && depthFb->addressStart < kFbMaxAddr) {
+                            depthFb->copyNativeToRAM(&(writeBackRDRAM ? writeBackRDRAM : RDRAM)[depthFb->addressStart], depthWriteWidth, depthRowStart, std::min(depthRowEnd, depthFb->height));
                         }
                     }
 

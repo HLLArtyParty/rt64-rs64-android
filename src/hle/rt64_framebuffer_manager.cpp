@@ -245,7 +245,16 @@ namespace RT64 {
     }
 
     void FramebufferManager::reinterpretTileSetup(RenderWorker *renderWorker, const FramebufferOperation &op, hlslpp::float2 resolutionScale, bool usesHDR) {
-        assert(tileCopies.find(op.reinterpretTile.srcId) != tileCopies.end());
+        // ROGUE-SQUADRON-RECOMP fix (2026-05-20): the rs64_sanitize_fb_registry
+        // hook in src/main/rt64_render_context.cpp erases garbage Framebuffer
+        // entries (low/high raw addresses from Factor 5 cinematic CIMGs) after
+        // processDisplayLists. Operations referencing those FBs' tile copies
+        // may still be queued in drawFbOperations and reach setupOperations
+        // here. The tileCopies entry was never created (or was implicitly
+        // cleaned). Skip silently instead of asserting.
+        if (tileCopies.find(op.reinterpretTile.srcId) == tileCopies.end()) {
+            return;
+        }
 
         // Source tile must exist.
         TileCopy &srcTile = tileCopies[op.reinterpretTile.srcId];
