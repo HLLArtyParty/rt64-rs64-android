@@ -39,6 +39,7 @@ extern "C" {
     extern volatile unsigned g_op_bf_count;     // explosion-bloom tri counter (fb-dump trigger)
     extern volatile unsigned g_most_drawn_fb;   // heaviest-drawn color image (def in core)
     extern volatile unsigned g_most_drawn_fb_width;  // its color-image width (def in core)
+    extern volatile unsigned long long g_most_drawn_fb_ms;  // steady-clock ms of its last texrect (def in core)
     extern volatile int g_explosion_hold;       // explosion-phase crawl countdown (def in core)
 }
 

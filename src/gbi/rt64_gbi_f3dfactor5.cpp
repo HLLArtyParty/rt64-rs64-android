@@ -46,6 +46,7 @@
 
 extern "C" volatile unsigned g_most_drawn_fb = 0;
 extern "C" volatile unsigned g_most_drawn_fb_width = 0;  // width of g_most_drawn_fb's color image
+extern "C" volatile unsigned long long g_most_drawn_fb_ms = 0;  // steady-clock ms of its last texrect
 extern "C" volatile unsigned g_f5_task_hops = 0;    // previous task's chunk transitions (diagnostic)
 extern "C" volatile unsigned g_f5_task_faces = 0;   // previous task's emitted faces
 extern "C" volatile int g_explosion_hold = 0;
@@ -390,10 +391,11 @@ namespace RT64 {
             // ROGUESQ_LOG_GFX_TASK: trace near-LOD (shift 0) and blended tiles to catch transition garbage.
             { static bool s_lg = env_on("ROGUESQ_LOG_GFX_TASK", false); static int s_n = 0;
               const uint32_t w5 = rec[2].w1 & 0xFFFF, w6 = rec[3].w0 & 0xFFFF;
-              if (s_lg && (shift == 0 || w5 || w6) && ++s_n <= 300) {
+              bool blank = true; for (int k = 0; k < 25 && blank; ++k) blank = (H[k] == 0);
+              if (s_lg && (shift == 0 || w5 || w6 || blank) && ++s_n <= 600) {
                   int hmin = 127, hmax = -128; for (int k = 0; k < 25; ++k) { if (H[k] < hmin) hmin = H[k]; if (H[k] > hmax) hmax = H[k]; }
-                  std::fprintf(stderr, "[f5-tile] task=%llu x=%d y=%d z=%d size=%d N=%d shift=%d w5=%04X w6=%04X hptr=%06X h=[%d,%d]" "\n",
-                      (unsigned long long)state->displayListCounter, x, y, z, sz, gridN, shift, w5, w6, hptr, hmin, hmax); std::fflush(stderr); } }
+                  std::fprintf(stderr, "[f5-tile] task=%llu x=%d y=%d z=%d size=%d N=%d shift=%d w5=%04X w6=%04X hptr=%06X h=[%d,%d] blank=%d" "\n",
+                      (unsigned long long)state->displayListCounter, x, y, z, sz, gridN, shift, w5, w6, hptr, hmin, hmax, (int)blank); std::fflush(stderr); } }
             // Stitch to flat neighbors: a grid edge facing a coarse (flat-rendered) neighbor must be a
             // straight line between its corners, else its subdivided intermediate verts T-junction with the
             // flat quad. Detect flat vs grid neighbors from the level tile grid (D_80136DC0): grid cells have
@@ -809,29 +811,21 @@ namespace RT64 {
             gbi->map[0x08] = &op_bf_tri;
             gbi->map[0x09] = &op_consume16;      // BE
             gbi->map[0x0A] = &op_consume16;      // BD
-            // G_MW_FOG (index 8) on this ucode is one signed 16.16 multiplier M, not F3DEX (mul, offset):
-            // the vertex pipeline computes alpha = clamp(z_screen * M * S / 65536, 0, S) with S = 255
-            // (boot code) and offset ~0 (DMEM 0x164 untouched), i.e. 255 everywhere except right at the
-            // near plane. Map to RT64's z/w form with mul = offset = M*255*511/65536 so the visible range
-            // stays saturated like hardware. ROGUESQ_F5_NOFOG=1 drops the word (fog off) for A/B;
-            // ROGUESQ_F5_FOG_RAW=1 passes it through as F3DEX (mul, offset) (old behavior).
+            // G_MW_FOG (index 8) on this ucode is a single 16.16 multiplier for a near-plane fade, not the
+            // F3DEX (mul, offset) pair; fed to RT64's z/w curve it whites out the nearest geometry whenever
+            // the low half reads negative (the LucasArts flyover "hole"). Hardware shows no distance fog
+            // (verified against PJ64 goldens), so keep RT64 fog at zero. ROGUESQ_F5_FOG_RAW=1 restores the
+            // F3DEX reading; ROGUESQ_F5_FOG_FORCE="mul,offset" pins fixed values for A/B.
             { static GBIFunction s_mw = gbi->map[0xBC];
               s_mw_orig = s_mw;
               gbi->map[0xBC] = +[](State* state, DisplayList** dl) {
-                  static bool s_nofog = env_on("ROGUESQ_F5_NOFOG", false);
                   static bool s_raw = env_on("ROGUESQ_F5_FOG_RAW", false);
-                  if (((*dl)->w0 & 0xFF) == 8) {
-                      if (s_nofog) return;
-                      static const char* s_force = std::getenv("ROGUESQ_F5_FOG_FORCE");   // "mul,offset"
-                      if (s_force && *s_force) { int fm = 0, fo = 0; std::sscanf(s_force, "%d,%d", &fm, &fo); state->rsp->setFog((int16_t)fm, (int16_t)fo); return; }
-                      if (!s_raw) {
-                          const uint32_t w1 = (*dl)->w1;
-                          const double M = (double)(int16_t)(w1 >> 16) + (double)(w1 & 0xFFFF) / 65536.0;
-                          double k = M * 255.0 * 511.0 / 65536.0;
-                          if (k > 32767.0) k = 32767.0; if (k < -32768.0) k = -32768.0;
-                          state->rsp->setFog((int16_t)k, (int16_t)k);
-                          return;
-                      }
+                  static const char* s_force = std::getenv("ROGUESQ_F5_FOG_FORCE");
+                  if (((*dl)->w0 & 0xFF) == 8 && !s_raw) {
+                      int fm = 0, fo = 0;
+                      if (s_force && *s_force) std::sscanf(s_force, "%d,%d", &fm, &fo);
+                      state->rsp->setFog((int16_t)fm, (int16_t)fo);
+                      return;
                   }
                   s_mw_orig(state, dl);
               }; }

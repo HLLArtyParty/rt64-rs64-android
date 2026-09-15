@@ -514,6 +514,12 @@ namespace RT64 {
                     static uint32_t s_bestFb = 0; static float s_bestAct = 0;
                     if (a >= s_bestAct) { s_bestAct = a; s_bestFb = cimg; g_most_drawn_fb = cimg; g_most_drawn_fb_width = state->rdp->colorImage.width; }
                     else if (cimg == s_bestFb) { s_bestAct = a; }  // track the leader's decay
+                    // Stamp the leader's last texrect so the present-side menu fix can tell a live
+                    // 512-wide menu buffer from a stale one (the mission crawl draws only tris).
+                    if (cimg == s_bestFb) {
+                        g_most_drawn_fb_ms = (unsigned long long)std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now().time_since_epoch()).count();
+                    }
                     // Periodically re-scan for the true max (leader may have decayed below another).
                     if ((s_tick & 0x3F) == 0) {
                         uint32_t mf = 0; float mx = 0;

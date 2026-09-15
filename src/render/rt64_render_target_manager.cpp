@@ -4,6 +4,9 @@
 
 #include "rt64_render_target_manager.h"
 
+#include <cstdio>
+#include <cstdlib>
+
 #include "xxHash/xxh3.h"
 
 namespace RT64 {
@@ -51,6 +54,9 @@ namespace RT64 {
         }
 
         target = std::make_unique<RenderTarget>(key.address, key.fbType, multisampling, usesHDR);
+        { static const bool s_lg = std::getenv("ROGUESQ_LOG_RT") != nullptr;
+          if (s_lg) { std::fprintf(stderr, "[rt-mgr] NEW render target addr=0x%08X type=%d -> map=%zu override=%zu\n",
+              (unsigned)key.address, (int)key.fbType, targetMap.size(), overrideMap.size()); std::fflush(stderr); } }
         return *target;
     }
     

@@ -4,7 +4,12 @@
 
 #include "rt64_raster_shader_cache.h"
 
+#include <atomic>
+
 #include "common/rt64_thread.h"
+
+// ROGUESQ_LOG_FRAMEGEN counters (defined in rt64_state.cpp).
+extern std::atomic<unsigned> g_rs64_fg_draws, g_rs64_fg_pipe, g_rs64_fg_uber, g_rs64_fg_variant, g_rs64_fg_pso;
 
 #define ENABLE_OPTIMIZED_SHADER_GENERATION
 
@@ -60,6 +65,7 @@ namespace RT64 {
                 assert((shaderCache->shaderUber != nullptr) && "Ubershader should've been created by the time a new shader is submitted to the cache.");
                 const RenderPipelineLayout *uberPipelineLayout = shaderCache->shaderUber->pipelineLayout.get();
                 const RenderMultisampling multisampling = shaderCache->multisampling;
+                ++g_rs64_fg_pso;
                 std::unique_ptr<RasterShader> newShader = std::make_unique<RasterShader>(shaderCache->device, shaderDesc, uberPipelineLayout, shaderCache->shaderFormat, multisampling, shaderCache->shaderCompiler.get(), &shaderCache->optimizerCacheSPIRV);
 
                 {
@@ -123,6 +129,7 @@ namespace RT64 {
             }
 
             found = true;
+            ++g_rs64_fg_variant;
         }
 
         // Push a new shader compilation to the queue.

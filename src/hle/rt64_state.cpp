@@ -23,6 +23,11 @@
 #include "rt64_interpreter.h"
 #include "rhi/rt64_render_hooks.h"
 
+#include <atomic>
+// ROGUESQ_LOG_FRAMEGEN command-generation counters (defined here, incremented across
+// rt64_framebuffer_renderer.cpp and rt64_raster_shader_cache.cpp, emitted per submit above).
+std::atomic<unsigned> g_rs64_fg_draws{0}, g_rs64_fg_pipe{0}, g_rs64_fg_uber{0}, g_rs64_fg_variant{0}, g_rs64_fg_pso{0};
+
 //#define ASSERT_ON_BLENDER_EMULATION
 #define SYNC_ON_EVERY_FB_PAIR 0
 
@@ -1447,10 +1452,20 @@ namespace RT64 {
                             depthFb->lastWriteType = Framebuffer::Type::Depth;
                         }
 
+                        // ROGUESQ_LOG_FULLSYNC=1: per-pair readback dims. A bogus colorFb/writeWidth
+                        // makes copyRenderTargetToNative dispatch an enormous shader that hangs the GPU
+                        // submit at execute() (the hangar black-screen hang). The last pair before a
+                        // [fullsync-exec] begin with no matching end is the culprit.
+                        { static int s_lf = -1; if (s_lf < 0) { const char* e = std::getenv("ROGUESQ_LOG_FULLSYNC"); s_lf = (e && *e && *e != '0') ? 1 : 0; }
+                          if (s_lf) { std::fprintf(stderr, "[fullsync-pair] pc=%u colorFb=%ux%u readH=%u colorImg.w=%u addr=0x%08X fmt=%u writeW=%u rows=%u..%u depthW=%u\n",
+                              pairCursor, colorFb->width, colorFb->height, colorFb->readHeight, colorImg.width, colorImg.address, (unsigned)colorImg.fmt,
+                              colorWriteWidth, colorRowStart, colorRowEnd, depthWriteWidth); std::fflush(stderr); } }
+
                         // Copy results from render targets back to RAM.
                         colorFb->copyRenderTargetToNative(ext.framebufferGraphicsWorker, colorTarget, colorWriteWidth, colorRowStart, colorRowEnd, colorImg.fmt, ditherRandomSeed++, ext.shaderLibrary);
 
-                        if (depthWriteWidth > 0) {
+                        static const bool s_skip_depth_rb = std::getenv("ROGUESQ_SKIP_DEPTH_READBACK") != nullptr;
+                        if (depthWriteWidth > 0 && !s_skip_depth_rb) {
                             depthFb->copyRenderTargetToNative(ext.framebufferGraphicsWorker, depthTarget, depthWriteWidth, depthRowStart, depthRowEnd, G_IM_FMT_DEPTH, ditherRandomSeed++, ext.shaderLibrary);
                         }
                     }
@@ -1463,8 +1478,20 @@ namespace RT64 {
 
                 ext.framebufferGraphicsWorker->commandList->end();
                 framebufferRenderer->waitForUploaders();
-                ext.framebufferGraphicsWorker->execute();
-                ext.framebufferGraphicsWorker->wait();
+                { static int s_lf = -1; if (s_lf < 0) { const char* e = std::getenv("ROGUESQ_LOG_FULLSYNC"); s_lf = (e && *e && *e != '0') ? 1 : 0; }
+                  static unsigned s_ex = 0; unsigned ex = ++s_ex;
+                  if (s_lf) { std::fprintf(stderr, "[fullsync-exec #%u] begin pairs=[%u,%u)\n", ex, framebufferPairCursor, maxFramebufferPair); std::fflush(stderr); }
+                  // ROGUESQ_LOG_FRAMEGEN: per-submit command-generation profile, to A/B the hangar
+                  // (solid 3D + depth, hangs) vs AVAILABLE CRAFT (holograms, works). Each fullSync
+                  // submit is one execute()+wait(); depth pass-splits force many per-pair submits.
+                  static const bool s_fg = std::getenv("ROGUESQ_LOG_FRAMEGEN") != nullptr;
+                  if (s_fg) { std::fprintf(stderr, "[framegen submit#%u] pairs=[%u,%u) draws=%u pipeSwitch=%u uberMiss=%u variantReq=%u psoCreate=%u\n",
+                      ex, framebufferPairCursor, maxFramebufferPair,
+                      g_rs64_fg_draws.exchange(0), g_rs64_fg_pipe.exchange(0), g_rs64_fg_uber.exchange(0),
+                      g_rs64_fg_variant.exchange(0), g_rs64_fg_pso.exchange(0)); std::fflush(stderr); }
+                  ext.framebufferGraphicsWorker->execute();
+                  ext.framebufferGraphicsWorker->wait();
+                  if (s_lf) { std::fprintf(stderr, "[fullsync-exec #%u] end\n", ex); std::fflush(stderr); } }
 
                 pairCursor = framebufferPairCursor;
                 while (pairCursor < maxFramebufferPair) {

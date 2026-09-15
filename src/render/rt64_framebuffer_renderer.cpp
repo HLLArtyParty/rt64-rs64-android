@@ -9,6 +9,9 @@
 #include <cstdlib>
 #include <cstring>
 
+// ROGUESQ_LOG_FRAMEGEN counters (defined in rt64_state.cpp).
+extern std::atomic<unsigned> g_rs64_fg_draws, g_rs64_fg_pipe, g_rs64_fg_uber, g_rs64_fg_variant, g_rs64_fg_pso;
+
 #include "../include/rt64_extended_gbi.h"
 
 #include "common/rt64_elapsed_timer.h"
@@ -550,6 +553,7 @@ namespace RT64 {
         };
 
         auto drawCallTriangles = [&](const InstanceDrawCall &drawCall) {
+            ++g_rs64_fg_draws;
             if (drawCall.type == InstanceDrawCall::Type::IndexedTriangles) {
                 worker->commandList->drawIndexedInstanced(drawCall.triangles.faceCount * 3, 1, drawCall.triangles.indexStart, 0, 0);
             }
@@ -719,6 +723,7 @@ namespace RT64 {
                 }
 
                 if (previousPipeline != triangles.pipeline) {
+                    ++g_rs64_fg_pipe;
                     worker->commandList->setPipeline(triangles.pipeline);
                     previousPipeline = triangles.pipeline;
                 }
@@ -1792,6 +1797,7 @@ namespace RT64 {
                             triangles.pipeline = gpuShader->pipeline.get();
                         }
                         else {
+                            ++g_rs64_fg_uber;
                             const bool copyMode = (call.shaderDesc.otherMode.cycleType() == G_CYC_COPY);
                             triangles.pipeline = rasterShaderUber->getPipeline(
                                 !copyMode && call.shaderDesc.otherMode.zCmp() && (call.shaderDesc.otherMode.zMode() != ZMODE_DEC),

@@ -4,6 +4,8 @@
 
 #include <algorithm>
 #include <cstring>
+#include <cstdio>
+#include <cstdlib>
 
 #include "common/rt64_thread.h"
 
@@ -137,6 +139,11 @@ namespace RT64 {
     }
 
     void BufferUploader::commandListCopyResources(RenderWorker *worker) {
+        // ROGUESQ_LOG_UPLOAD=1: report the per-frame upload total and any oversized single copy.
+        // A bogus srcDataIndexRange/stride yields a giant copyBufferRegion that the GPU driver grinds
+        // on for tens of seconds (the hangar wedge). TMEM/draw buffers are normally << 16 MB.
+        static const bool s_lu = [](){ const char* e = std::getenv("ROGUESQ_LOG_UPLOAD"); return e && *e && *e != '0'; }();
+        uint64_t totalBytes = 0; unsigned count = 0;
         for (const Upload &u : pendingUploads) {
             if (!u.valid()) {
                 continue;
@@ -144,8 +151,16 @@ namespace RT64 {
 
             const uint64_t srcOffset = u.srcDataIndexRange.first * u.srcDataStride;
             const uint64_t srcSize = (u.srcDataIndexRange.second - u.srcDataIndexRange.first) * u.srcDataStride;
+            if (s_lu) {
+                totalBytes += srcSize; ++count;
+                if (srcSize > (16ull << 20))
+                    std::fprintf(stderr, "[upload] BIG copy srcSize=%llu range=%llu..%llu stride=%llu off=%llu\n",
+                        (unsigned long long)srcSize, (unsigned long long)u.srcDataIndexRange.first,
+                        (unsigned long long)u.srcDataIndexRange.second, (unsigned long long)u.srcDataStride, (unsigned long long)srcOffset), std::fflush(stderr);
+            }
             worker->commandList->copyBufferRegion(u.dstPair->defaultBuffer->at(srcOffset), u.dstPair->uploadBuffer->at(srcOffset), srcSize);
         }
+        if (s_lu && count) { static unsigned f = 0; if ((++f & 63) == 0 || totalBytes > (16ull << 20)) { std::fprintf(stderr, "[upload] frame uploads=%u totalBytes=%llu\n", count, (unsigned long long)totalBytes); std::fflush(stderr); } }
     }
 
     void BufferUploader::commandListAfterBarriers(RenderWorker *worker) {
