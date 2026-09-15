@@ -136,6 +136,8 @@ namespace RT64 {
         drawCall.rdpParams.fogColor = { 0.0f, 0.0f, 0.0f, 0.0f };
         drawCall.rdpParams.blendColor = { 0.0f, 0.0f, 0.0f, 0.0f };
         drawCall.cullBothMask = 0;
+        drawCall.cullFrontMask = 0;
+        drawCall.f5Cull = false;
         drawCall.shadingSmoothMask = 0;
         drawCall.NoN = false;
         drawCall.extendedType = DrawExtendedType::None;
@@ -451,6 +453,8 @@ namespace RT64 {
         Workload &workload = ext.workloadQueue->workloads[workloadCursor];
         FramebufferPair &fbPair = workload.fbPairs[workload.currentFramebufferPairIndex()];
         drawCall.cullBothMask = rsp->cullBothMask;
+        drawCall.cullFrontMask = rsp->cullFrontMask;
+        drawCall.f5Cull = rsp->f5Cull;
         drawCall.shadingSmoothMask = rsp->shadingSmoothMask;
         drawCall.NoN = rsp->NoN;
         drawCall.drawStatusChanges = drawStatus.changed;
@@ -1013,7 +1017,15 @@ namespace RT64 {
                     if (proj.usesViewport()) {
                         // F5 cull=BOTH means double-sided (draw both faces), not single-face cull.
                         const uint32_t cullBits = callDesc.geometryMode & callDesc.cullBothMask;
-                        flags.culling = (cullBits != 0) && (cullBits != callDesc.cullBothMask);
+                        if (callDesc.f5Cull) {
+                            // GPU culling is the real cull (the CPU path only swaps winding), so it must follow the
+                            // same F5 rule: only the back bit culls. Bit 0x1000 alone is a texcoord flag and never
+                            // culls -- front-culling it dropped the radar disc and sweep.
+                            flags.culling = (cullBits == (callDesc.cullBothMask & ~callDesc.cullFrontMask));
+                        }
+                        else {
+                            flags.culling = (cullBits != 0) && (cullBits != callDesc.cullBothMask);
+                        }
                         flags.smoothShade = (callDesc.geometryMode & callDesc.shadingSmoothMask) != 0;
                         flags.NoN = callDesc.NoN;
                     }

@@ -104,9 +104,6 @@ float4 sampleTMEM16b(uint pixelValue0, uint pixelValue1, uint fmt) {
     case G_IM_FMT_IA:
         return sampleTMEMIA16(pixelValue16bit);
     case G_IM_FMT_CI:
-        // The texture unit fetches 16-bit CI like RGBA16 (Rogue Squadron terrain binds CI/16b; hardware
-        // goldens show the RGBA16 speckle where the I16 reading gives flat white).
-        return sampleTMEMRGBA16(pixelValue16bit);
     case G_IM_FMT_I:
         return sampleTMEMI16(pixelValue0, pixelValue1);
     case G_IM_FMT_YUV:

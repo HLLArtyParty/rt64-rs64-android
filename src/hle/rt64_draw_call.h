@@ -101,8 +101,10 @@ namespace RT64 {
 
         // GBI specific parameters.
         uint32_t cullBothMask;
+        uint32_t cullFrontMask;
         uint32_t shadingSmoothMask;
         bool NoN;
+        bool f5Cull;
 
         // GBI extended parameters.
         DrawExtendedType extendedType;

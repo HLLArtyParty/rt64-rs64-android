@@ -134,6 +134,8 @@ namespace RT64 {
         static constexpr int F5_MAX_DEPTH = 64;
         static uint32_t s_task_faces = 0;
         static uint32_t s_task_budget_trip = 0;
+        static uint32_t s_task_tiles = 0;
+        static uint32_t s_task_maxchain = 0;
         static void f5_ensure_viewport(State* state);
         // Above the N64's 8 MB (the recomp heap does use 0x71E000; hardware never sees this range; RT64's
         // segmented mask allows 16 MB and the host buffer is 512 MB).
@@ -175,7 +177,7 @@ namespace RT64 {
             if (depth >= (uint32_t)F5_MAX_DEPTH) return false;
             uint32_t& n = s_chain_len[depth];
             for (uint32_t i = 0; i < n; ++i) if (s_chain[depth][i] == chunk) return true;
-            if (n < (uint32_t)F5_CHAIN_MAX) s_chain[depth][n++] = chunk;
+            if (n < (uint32_t)F5_CHAIN_MAX) { s_chain[depth][n++] = chunk; if (n > s_task_maxchain) s_task_maxchain = n; }
             return false;
         }
         static void f5_next_chunk(State* state, DisplayList** dl) {
@@ -186,9 +188,11 @@ namespace RT64 {
             // The allocated chunk list is doubly linked: the next chunk's prev word must point back here.
             // A stale call into a recycled chunk otherwise walks the whole free list (thousands of garbage faces).
             const bool linked = (next >> 24) == 0x80u && target != 0 && target + 0x108u <= RDRAMSize && f5_rd32(state, target + 4) == (0x80000000u | base);
-            // Legitimate next-chains are short (hw goldens: <= 19 chunks per sub-list level; root uses 07 links);
-            // a stale call into a recycled chunk would otherwise walk the (also doubly linked) free list.
-            static const uint32_t s_chain_cap = [](){ const char* e = std::getenv("ROGUESQ_F5_CHAIN_CAP"); return (e && *e) ? (uint32_t)std::atoi(e) : 64u; }();
+            // Backstop for a stale call into a recycled chunk walking the (also doubly linked) free list.
+            // Cap = F5_CHAIN_MAX, the window f5_chunk_revisit can still detect a cycle in. A dense frame
+            // legitimately chains ~84 chunks (LucasArts flyover, 359 tiles / 1597 faces); the old cap of 64
+            // truncated those lists mid-frame and dropped a contiguous block of terrain.
+            static const uint32_t s_chain_cap = [](){ const char* e = std::getenv("ROGUESQ_F5_CHAIN_CAP"); return (e && *e) ? (uint32_t)std::atoi(e) : (uint32_t)F5_CHAIN_MAX; }();
             const bool tooLong = d < (uint32_t)F5_MAX_DEPTH && s_chain_len[d] >= s_chain_cap;
             if (!linked || tooLong || target == base || ++s_chunk_hops > 4096u || f5_chunk_revisit(d, target)) {
                 static int s_n = 0;
@@ -220,9 +224,9 @@ namespace RT64 {
                 // ROGUESQ_LOG_GFX_TASK: one line per finished F5 task (faces/entries/hops + whether a
                 // budget cap ended it) to correlate object flicker with dropped geometry.
                 { static bool s_tl = env_on("ROGUESQ_LOG_GFX_TASK", false);
-                  if (s_tl) { std::fprintf(stderr, "[f5-task] done before #%llu: faces=%u entries=%u hops=%u budget_trip=%u\n",
-                      (unsigned long long)s_chunk_counter, s_task_faces, s_task_entries, s_chunk_hops, s_task_budget_trip); std::fflush(stderr); } }
-                s_task_budget_trip = 0;
+                  if (s_tl) { std::fprintf(stderr, "[f5-task] done before #%llu: faces=%u entries=%u hops=%u budget_trip=%u tiles=%u maxchain=%u\n",
+                      (unsigned long long)s_chunk_counter, s_task_faces, s_task_entries, s_chunk_hops, s_task_budget_trip, s_task_tiles, s_task_maxchain); std::fflush(stderr); } }
+                s_task_budget_trip = 0; s_task_tiles = 0; s_task_maxchain = 0;
                 s_chunk_hops = 0; s_task_faces = 0; s_task_entries = 0; s_hop_n = 0;
                 std::memset(s_chunk_base, 0, sizeof(s_chunk_base));
                 std::memset(s_chain_len, 0, sizeof(s_chain_len));
@@ -382,54 +386,57 @@ namespace RT64 {
             // (using a smaller scale drops grid tiles below the flat plateaus -> stepped layers). Env mult tunes.
             const float hcoeff = 16.0f * s_hmul;
             f5_ensure_viewport(state);
-            int8_t H[25];
-            // Resample the N*N height grid onto the 5x5 the mesh below is built from (nearest for N != 5).
-            for (int r = 0; r < 5; ++r) for (int c = 0; c < 5; ++c) {
-                const int gr = (gridN == 5) ? r : (int)(r * (gridN - 1) / 4.0f + 0.5f), gc = (gridN == 5) ? c : (int)(c * (gridN - 1) / 4.0f + 0.5f);
-                H[r * 5 + c] = (int8_t)ram[(hptr + (uint32_t)(gr * gridN + gc)) ^ 3];
-            }
-            // ROGUESQ_LOG_GFX_TASK: trace near-LOD (shift 0) and blended tiles to catch transition garbage.
-            { static bool s_lg = env_on("ROGUESQ_LOG_GFX_TASK", false); static int s_n = 0;
-              const uint32_t w5 = rec[2].w1 & 0xFFFF, w6 = rec[3].w0 & 0xFFFF;
-              bool blank = true; for (int k = 0; k < 25 && blank; ++k) blank = (H[k] == 0);
-              if (s_lg && (shift == 0 || w5 || w6 || blank) && ++s_n <= 600) {
-                  int hmin = 127, hmax = -128; for (int k = 0; k < 25; ++k) { if (H[k] < hmin) hmin = H[k]; if (H[k] > hmax) hmax = H[k]; }
-                  std::fprintf(stderr, "[f5-tile] task=%llu x=%d y=%d z=%d size=%d N=%d shift=%d w5=%04X w6=%04X hptr=%06X h=[%d,%d] blank=%d" "\n",
-                      (unsigned long long)state->displayListCounter, x, y, z, sz, gridN, shift, w5, w6, hptr, hmin, hmax, (int)blank); std::fflush(stderr); } }
-            // Stitch to flat neighbors: a grid edge facing a coarse (flat-rendered) neighbor must be a
-            // straight line between its corners, else its subdivided intermediate verts T-junction with the
-            // flat quad. Detect flat vs grid neighbors from the level tile grid (D_80136DC0): grid cells have
-            // tile-index top bits 110 (raw & 0xE000 == 0xC000), flat/coarse cells don't. Verified offline.
-            bool stL = false, stR = false, stU = false, stD = false;
+            // Parser overlay 0xC samples the N*N input at the LOD stride: output (i,j) = input
+            // [(i*stride)*N + j*stride], an M*M grid. Samples between stride points are never read at
+            // this LOD and hold unrelated heights -- meshing them produced spikes on steep terrain.
+            const int stride = 1 << shift;
+            float G[5][5] = {};
+            for (int i = 0; i < M && i < 5; ++i) for (int j = 0; j < M && j < 5; ++j)
+                G[i][j] = (float)(int8_t)ram[(hptr + (uint32_t)((i * stride) * gridN + j * stride)) ^ 3];
+            // Edge LOD seams (overlays 0x14 rows, 0x18 columns). Record bytes +4..+7 are the left, right,
+            // top and bottom neighbour LODs. When one differs from this tile's shift, the odd samples along
+            // that edge become the mean of their neighbours (a straight edge, no T-junction), then blend
+            // toward the corner line by that edge's weight (+0x16 L, +0x18 R, +0x1A T, +0x1C B, 16.16).
             {
-                static bool s_stitch = env_on("ROGUESQ_F5_TERRAIN_STITCH", true);
-                if (s_stitch) {
-                    auto rd32 = [&](uint32_t a){ return ((uint32_t)ram[a^3]<<24)|((uint32_t)ram[(a+1)^3]<<16)|((uint32_t)ram[(a+2)^3]<<8)|(uint32_t)ram[(a+3)^3]; };
-                    auto rd16 = [&](uint32_t a){ return (uint32_t)((ram[a^3]<<8)|ram[(a+1)^3]); };
-                    const uint32_t idxArr = rd32(0x136DC0) & 0x00FFFFFFu, tileData = rd32(0x136DC4) & 0x00FFFFFFu;
-                    const uint32_t gw = rd16(0x136DF8), gh = rd16(0x136DFA);   // hdr +0x38 width, +0x3A height
-                    const int csz = (int)span;                                 // tile world spacing
-                    if (idxArr > 0x1000 && idxArr < RDRAMSize && tileData > 0x1000 && tileData < RDRAMSize &&
-                        gw > 0 && gw <= 256 && gh > 0 && gh <= 256 && csz > 0) {
-                        static uint32_t s_idxArr = 0; static int s_ox = 0, s_oz = 0; static bool s_ook = false;
-                        if (idxArr != s_idxArr) s_ook = false;                 // new level: re-derive origin
-                        if (!s_ook) {                                         // derive origin from this tile's cell
-                            const uint32_t ti = (hptr - 5u - tileData) / 0x1Eu;
-                            for (uint32_t r2 = 0; r2 < gh && !s_ook; ++r2) for (uint32_t c2 = 0; c2 < gw; ++c2)
-                                if ((rd16(idxArr + (r2 * gw + c2) * 2) & 0x1FFF) == ti) {
-                                    s_ox = x - (int)c2 * csz; s_oz = z - (int)r2 * csz; s_idxArr = idxArr; s_ook = true; break; }
-                        }
-                        if (s_ook) {
-                            const int col = (x - s_ox) / csz, row = (z - s_oz) / csz;
-                            auto flatNb = [&](int c, int r) -> bool {         // true = coarse neighbor -> straighten edge
-                                if (c < 0 || r < 0 || c >= (int)gw || r >= (int)gh) return false;   // off-map: no crack
-                                return (rd16(idxArr + ((uint32_t)r * gw + (uint32_t)c) * 2) & 0xE000u) != 0xC000u; };
-                            stL = flatNb(col - 1, row); stR = flatNb(col + 1, row);
-                            stU = flatNb(col, row - 1); stD = flatNb(col, row + 1);
+                static bool s_seam = env_on("ROGUESQ_F5_TERRAIN_SEAMS", true);
+                const uint32_t nbw = rec[0].w1;
+                const int nb[4] = { (int)((nbw >> 24) & 0xFF), (int)((nbw >> 16) & 0xFF), (int)((nbw >> 8) & 0xFF), (int)(nbw & 0xFF) };
+                const float wt[4] = { (float)(rec[2].w1 & 0xFFFFu) / 65536.0f, (float)((rec[3].w0 >> 16) & 0xFFFFu) / 65536.0f,
+                                      (float)(rec[3].w0 & 0xFFFFu) / 65536.0f, (float)((rec[3].w1 >> 16) & 0xFFFFu) / 65536.0f };
+                // edge e: 0=L (col 0), 1=R (col M-1), 2=T (row 0), 3=B (row M-1); k walks along the edge
+                auto at = [&](int e, int k) -> float& {
+                    return e == 0 ? G[k][0] : e == 1 ? G[k][M - 1] : e == 2 ? G[0][k] : G[M - 1][k]; };
+                for (int e = 0; s_seam && M > 2 && e < 4; ++e) {
+                    if (nb[e] == shift) continue;
+                    for (int k = 1; k + 1 < M; k += 2) at(e, k) = 0.5f * (at(e, k - 1) + at(e, k + 1));
+                    if (wt[e] > 0.0f) {
+                        const float c0 = at(e, 0), c1 = at(e, M - 1);
+                        for (int k = 1; k + 1 < M; ++k) {
+                            const float line = c0 + (c1 - c0) * (float)k / (float)(M - 1);
+                            at(e, k) = line * wt[e] + at(e, k) * (1.0f - wt[e]);
                         }
                     }
                 }
             }
+            // Upsample the M*M grid onto the 5x5 the mesh is built from (identity for M == 5).
+            float H[25];
+            for (int r = 0; r < 5; ++r) for (int c = 0; c < 5; ++c) {
+                const float gi = (float)r * (float)(M - 1) / 4.0f, gj = (float)c * (float)(M - 1) / 4.0f;
+                int i0 = (int)gi, j0 = (int)gj; if (i0 > M - 2) i0 = M - 2; if (j0 > M - 2) j0 = M - 2;
+                if (i0 < 0) i0 = 0; if (j0 < 0) j0 = 0;
+                const int i1 = (M > 1) ? i0 + 1 : i0, j1 = (M > 1) ? j0 + 1 : j0;
+                const float ti = gi - (float)i0, tj = gj - (float)j0;
+                H[r * 5 + c] = (G[i0][j0] * (1.0f - tj) + G[i0][j1] * tj) * (1.0f - ti)
+                             + (G[i1][j0] * (1.0f - tj) + G[i1][j1] * tj) * ti;
+            }
+            // ROGUESQ_LOG_GFX_TASK: trace near-LOD (shift 0) and blended tiles to catch transition garbage.
+            { static bool s_lg = env_on("ROGUESQ_LOG_GFX_TASK", false); static int s_n = 0;
+              const uint32_t w5 = rec[2].w1 & 0xFFFF, w6 = rec[3].w0 & 0xFFFF;
+              bool blank = true; for (int k = 0; k < 25 && blank; ++k) blank = (H[k] == 0.0f);
+              if (s_lg && (shift == 0 || w5 || w6 || blank) && ++s_n <= 600) {
+                  int hmin = 127, hmax = -128; for (int k = 0; k < 25; ++k) { if (H[k] < hmin) hmin = H[k]; if (H[k] > hmax) hmax = H[k]; }
+                  std::fprintf(stderr, "[f5-tile] task=%llu x=%d y=%d z=%d size=%d N=%d shift=%d w5=%04X w6=%04X hptr=%06X h=[%d,%d] blank=%d" "\n",
+                      (unsigned long long)state->displayListCounter, x, y, z, sz, gridN, shift, w5, w6, hptr, hmin, hmax, (int)blank); std::fflush(stderr); } }
             // Subdivision: the ucode (overlay 0x14) subdivides the 5x5 into a finer interpolated mesh for
             // smooth slopes; raw 5x5 quads look faceted. Bilinear-interpolate to (4*S+1)^2 verts. S from env
             // (per-tile LOD lives in w1 low bytes; uniform S avoids inter-tile cracks). Grid tiles span (M-1)*size
@@ -440,30 +447,34 @@ namespace RT64 {
             const int N = 4 * s_sub;   // cells per axis; N+1 verts per axis; 2*(N+1) <= 34 slots for S<=4
             RSP::Vertex* tmp = reinterpret_cast<RSP::Vertex*>(state->fromRDRAM(F5_VTX_SCRATCH + F5_FACE_SLOT * sizeof(RSP::Vertex)));
             auto emit_vertex = [&](RSP::Vertex& v, float fx, float fy) {
-                // On an edge facing a flat neighbor, follow the straight line between the tile's edge corners
-                // (matches the flat quad's straight edge); otherwise bilinear-interpolate the 5x5 samples.
-                float h;
-                if      (fx <= 0.0f && stL) h = (float)H[0] * (1.0f - fy/4.0f) + (float)H[20] * (fy/4.0f);   // left edge (col 0)
-                else if (fx >= 4.0f && stR) h = (float)H[4] * (1.0f - fy/4.0f) + (float)H[24] * (fy/4.0f);   // right edge (col 4)
-                else if (fy <= 0.0f && stU) h = (float)H[0] * (1.0f - fx/4.0f) + (float)H[4]  * (fx/4.0f);   // top edge (row 0)
-                else if (fy >= 4.0f && stD) h = (float)H[20]* (1.0f - fx/4.0f) + (float)H[24] * (fx/4.0f);   // bottom edge (row 4)
-                else {
-                    int x0 = (int)fx, y0 = (int)fy; if (x0 > 3) x0 = 3; if (y0 > 3) y0 = 3;
-                    const float tx = fx - x0, ty = fy - y0;
-                    h = ((float)H[y0*5+x0]*(1-tx) + (float)H[y0*5+x0+1]*tx) * (1-ty)
-                      + ((float)H[(y0+1)*5+x0]*(1-tx) + (float)H[(y0+1)*5+x0+1]*tx) * ty;
-                }
+                int x0 = (int)fx, y0 = (int)fy; if (x0 > 3) x0 = 3; if (y0 > 3) y0 = 3;
+                const float tx = fx - x0, ty = fy - y0;
+                const float h = (H[y0*5+x0]*(1-tx) + H[y0*5+x0+1]*tx) * (1-ty)
+                              + (H[(y0+1)*5+x0]*(1-tx) + H[(y0+1)*5+x0+1]*tx) * ty;
                 v.x = (int16_t)(x + (int32_t)(fx * step5));
                 v.y = (int16_t)(y + (int32_t)(h * hcoeff));
                 v.z = (int16_t)(z + (int32_t)(fy * step5));
                 v.flag = 0; v.s = (int16_t)(uvcell * fx); v.t = (int16_t)(uvcell * (4.0f - fy));
-                // Colors: hardware reads every (1<<shift)-th sample of the N*N color grid.
-                const int cstep = 1 << shift;
-                int cx = (int)((fx * (gridN - 1) / 4.0f) / cstep + 0.5f) * cstep, cy = (int)((fy * (gridN - 1) / 4.0f) / cstep + 0.5f) * cstep;
-                if (cx > gridN - 1) cx = gridN - 1; if (cy > gridN - 1) cy = gridN - 1;
-                const uint32_t cb = cptr + (uint32_t)(cy * gridN + cx) * 4;
-                v.color.r = ram[(cb + 0) ^ 3]; v.color.g = ram[(cb + 1) ^ 3];
-                v.color.b = ram[(cb + 2) ^ 3]; v.color.a = ram[(cb + 3) ^ 3];
+                // Colors: real samples sit every (1<<shift) in the N*N grid; the parser overlay averages
+                // between them, so interpolate bilinearly instead of snapping to the nearest sample.
+                {
+                    const int cstep = 1 << shift;
+                    const float gx = fx * (float)(gridN - 1) / 4.0f, gy = fy * (float)(gridN - 1) / 4.0f;
+                    int x0 = ((int)gx / cstep) * cstep, y0 = ((int)gy / cstep) * cstep;
+                    if (x0 > gridN - 1) x0 = gridN - 1; if (y0 > gridN - 1) y0 = gridN - 1;
+                    const int x1 = (x0 + cstep <= gridN - 1) ? x0 + cstep : x0, y1 = (y0 + cstep <= gridN - 1) ? y0 + cstep : y0;
+                    const float tx = (x1 != x0) ? (gx - (float)x0) / (float)(x1 - x0) : 0.0f;
+                    const float ty = (y1 != y0) ? (gy - (float)y0) / (float)(y1 - y0) : 0.0f;
+                    auto ch = [&](int cx, int cy, int k) -> float { return (float)ram[(cptr + (uint32_t)(cy * gridN + cx) * 4 + (uint32_t)k) ^ 3]; };
+                    uint8_t out[4];
+                    for (int k = 0; k < 4; ++k) {
+                        const float top = ch(x0, y0, k) * (1.0f - tx) + ch(x1, y0, k) * tx;
+                        const float bot = ch(x0, y1, k) * (1.0f - tx) + ch(x1, y1, k) * tx;
+                        float val = top * (1.0f - ty) + bot * ty + 0.5f;
+                        out[k] = (uint8_t)(val > 255.0f ? 255.0f : val);
+                    }
+                    v.color.r = out[0]; v.color.g = out[1]; v.color.b = out[2]; v.color.a = out[3];
+                }
             };
             const uint32_t base = 0x80000000u | (F5_VTX_SCRATCH + F5_FACE_SLOT * sizeof(RSP::Vertex));
             for (int rr = 0; rr < N; ++rr) {   // one 2-row strip at a time
@@ -489,6 +500,7 @@ namespace RT64 {
               if (s_lg && ((w0 >> 16) & 0xFFu) != 0x05u && ++s_n <= 40) {
                   std::fprintf(stderr, "[f5-op05] unusual header %08X %08X next %08X %08X\n", w0, (*dl)->w1, (*dl)[1].w0, (*dl)[1].w1); std::fflush(stderr); } }
             if (((w0 >> 16) & 0xFFu) != 0x05u) return;      // plain 8-byte command
+            ++s_task_tiles;
             if ((w0 >> 8) & 0x2u) f5_tile_quad(state, *dl);   // 05 05 02 = flat tile
             else                  f5_tile_grid(state, *dl);   // 05 05 00 = heightfield grid
             (*dl) += 4;                                       // 40-byte record
@@ -500,6 +512,16 @@ namespace RT64 {
         // The tri path multiplies each raw per-face UV by it (vmudn lo / vmadh hi) to get S10.5;
         // the game sends (W-1)/128 per material, so raw UVs are 4.12 normalized, not 8.8 texels.
         static thread_local int32_t s_tc_scale[2] = { 0, 0 };
+        // Fog = two signed 16.16 words: M at DMEM 0x160 (moveword 8 or 03 88) and O at DMEM 0x164
+        // (moveword 0x0A or 03 88). The ucode stores alpha = 255 * clamp(depth*M + O, 0, 1). RT64 takes
+        // alpha = depth*mul + offset, so mul = 255*M, offset = 255*O, written as floats: the values
+        // exceed RT64's int16 setFog range (a ramp only ~0.001 of depth wide).
+        static double s_f5_fog_m = 0.0, s_f5_fog_o = 0.0;
+        static void f5_apply_fog(State* state) {
+            state->rsp->fog.mul = (float)(255.0 * s_f5_fog_m);
+            state->rsp->fog.offset = (float)(255.0 * s_f5_fog_o);
+            state->rsp->fogChanged = true;
+        }
         static void f5_set_viewport(State* state, const int16_t* vs, const int16_t* vt);
         void op_03_f5(State* state, DisplayList** dl) {
             const uint32_t sub = ((*dl)->w0 >> 16) & 0xFF;
@@ -508,6 +530,10 @@ namespace RT64 {
                 const int16_t vs[4] = { (int16_t)(a >> 16), (int16_t)a, (int16_t)(b >> 16), (int16_t)b };
                 const int16_t vt[4] = { (int16_t)(c >> 16), (int16_t)c, (int16_t)(d >> 16), (int16_t)d };
                 f5_set_viewport(state, vs, vt);
+            } else if (sub == 0x88) {
+                s_f5_fog_m = (double)(int32_t)(*dl)[1].w0 / 65536.0;
+                s_f5_fog_o = (double)(int32_t)(*dl)[1].w1 / 65536.0;
+                f5_apply_fog(state);
             } else if (sub == 0x82) {
                 const uint32_t hi = (*dl)[1].w0, lo = (*dl)[2].w0;
                 s_tc_scale[0] = (int32_t)((hi & 0xFFFF0000u) | (lo >> 16));
@@ -811,20 +837,18 @@ namespace RT64 {
             gbi->map[0x08] = &op_bf_tri;
             gbi->map[0x09] = &op_consume16;      // BE
             gbi->map[0x0A] = &op_consume16;      // BD
-            // G_MW_FOG (index 8) on this ucode is a single 16.16 multiplier for a near-plane fade, not the
-            // F3DEX (mul, offset) pair; fed to RT64's z/w curve it whites out the nearest geometry whenever
-            // the low half reads negative (the LucasArts flyover "hole"). Hardware shows no distance fog
-            // (verified against PJ64 goldens), so keep RT64 fog at zero. ROGUESQ_F5_FOG_RAW=1 restores the
-            // F3DEX reading; ROGUESQ_F5_FOG_FORCE="mul,offset" pins fixed values for A/B.
+            // Moveword 8 / 0x0A write the fog M / O words (see f5_apply_fog). F3D reads 0x0A as a light
+            // color, so both are intercepted. ROGUESQ_F5_NOFOG=1 leaves fog untouched.
             { static GBIFunction s_mw = gbi->map[0xBC];
               s_mw_orig = s_mw;
               gbi->map[0xBC] = +[](State* state, DisplayList** dl) {
-                  static bool s_raw = env_on("ROGUESQ_F5_FOG_RAW", false);
-                  static const char* s_force = std::getenv("ROGUESQ_F5_FOG_FORCE");
-                  if (((*dl)->w0 & 0xFF) == 8 && !s_raw) {
-                      int fm = 0, fo = 0;
-                      if (s_force && *s_force) std::sscanf(s_force, "%d,%d", &fm, &fo);
-                      state->rsp->setFog((int16_t)fm, (int16_t)fo);
+                  const uint32_t idx = (*dl)->w0 & 0xFF;
+                  if (idx == 8 || idx == 0x0A) {
+                      static bool s_nofog = env_on("ROGUESQ_F5_NOFOG", false);
+                      if (s_nofog) return;
+                      const double v = (double)(int32_t)(*dl)->w1 / 65536.0;
+                      if (idx == 8) s_f5_fog_m = v; else s_f5_fog_o = v;
+                      f5_apply_fog(state);
                       return;
                   }
                   s_mw_orig(state, dl);
