@@ -273,6 +273,25 @@ namespace RT64 {
                 bool shiftedByHalf = false;
                 textureCache->useTexture(callTile.tmemHashOrID, submissionFrame, textureIndex, gpuTile.tcScale, gpuTile.textureDimensions, textureReplaced, hasMipmaps, shiftedByHalf);
 
+                // DIAG (ROGUESQ_LOG_SKYTEX=1): is the RGBA32 skybox texture actually bound at draw time,
+                // or is it a texture-cache miss -> blank slot (textureIndex 0)? Confirms/refutes the
+                // white-sky bind theory. RGBA32 (fmt=0 siz=3) is unique to the sky in this game.
+                {
+                    static int s_logsky = -1;
+                    if (s_logsky < 0) { const char* e = std::getenv("ROGUESQ_LOG_SKYTEX"); s_logsky = (e && e[0] == '1') ? 1 : 0; }
+                    if (s_logsky && callTile.loadTile.siz == 3 && callTile.loadTile.fmt == 0) {
+                        static int nSky = 0, nMiss = 0;
+                        ++nSky;
+                        if (textureIndex == 0) ++nMiss;
+                        if (nSky <= 40 || (nSky % 200) == 0) {
+                            fprintf(stderr, "[skytex] rgba32 hash=%016llx idx=%u %s (n=%d miss=%d)\n",
+                                (unsigned long long)callTile.tmemHashOrID, textureIndex,
+                                (textureIndex == 0) ? "MISS/BLANK" : "bound", nSky, nMiss);
+                            fflush(stderr);
+                        }
+                    }
+                }
+
                 // Describe the GPU tile for a regular texture.
                 gpuTile.ulScale.x = gpuTile.tcScale.x;
                 gpuTile.ulScale.y = gpuTile.tcScale.y;

@@ -13,6 +13,7 @@ namespace interop {
         float2 videoResolution;
         float2 textureResolution;
         float gamma;
+        float viFilter;   // N64 VI-style soften radius in color-target texels; 0 = off (default)
     };
 #ifdef HLSL_CPU
 };

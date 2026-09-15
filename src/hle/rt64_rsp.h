@@ -181,6 +181,7 @@ namespace RT64 {
         bool NoN;
         uint32_t cullBothMask;
         uint32_t cullFrontMask;
+        bool f5Cull = false;   // Factor 5: only G_CULL_BACK culls; 0x1000 is a texcoord flag, not CULL_FRONT
         uint32_t projMask;
         uint32_t loadMask;
         uint32_t pushMask;
@@ -260,6 +261,10 @@ namespace RT64 {
         template<bool addEmptyVelocity, uint32_t vertexSize>
         void setVertexCommon(uint32_t rdramAddress, uint32_t dstIndex, uint32_t dstMax);
         void modifyVertex(uint16_t dstIndex, uint16_t dstAttribute, uint32_t value);
+        // Appends a vertex lerped in model space between global verts ga and gb at parameter t.
+        // Model-space lerp is exact in clip space (MVP is affine), so the GPU CS re-transform
+        // reproduces the intended near-plane-clipped position. Returns the new global index.
+        uint32_t appendClippedVertex(uint32_t ga, uint32_t gb, float t);
         void setGeometryMode(uint32_t mask);
         void pushGeometryMode();
         void popGeometryMode();

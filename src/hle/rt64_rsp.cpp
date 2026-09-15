@@ -5,6 +5,7 @@
 #include "rt64_rsp.h"
 
 #include <cassert>
+#include <cstdio>
 
 #include "../include/rt64_extended_gbi.h"
 #include "common/rt64_common.h"
@@ -727,6 +728,52 @@ namespace RT64 {
         }
     }
 
+    uint32_t RSP::appendClippedVertex(uint32_t ga, uint32_t gb, float t) {
+        const int workloadCursor = state->ext.workloadQueue->writeCursor;
+        Workload &workload = state->ext.workloadQueue->workloads[workloadCursor];
+        auto &posFloats = workload.drawData.posFloats;
+        auto &velFloats = workload.drawData.velFloats;
+        auto &tcFloats = workload.drawData.tcFloats;
+        auto &tcVelFloats = workload.drawData.tcVelFloats;
+        auto &normColBytes = workload.drawData.normColBytes;
+        auto &viewProjIndices = workload.drawData.viewProjIndices;
+        auto &worldIndices = workload.drawData.worldIndices;
+        auto &fogIndices = workload.drawData.fogIndices;
+        auto &lightIndices = workload.drawData.lightIndices;
+        auto &lightCounts = workload.drawData.lightCounts;
+        auto &lookAtIndices = workload.drawData.lookAtIndices;
+        auto &posTransformed = workload.drawData.posTransformed;
+        auto &posScreen = workload.drawData.posScreen;
+
+        const uint32_t newIndex = workload.drawData.vertexCount();
+        auto lf = [t](float a, float b) { return a + (b - a) * t; };
+
+        for (int k = 0; k < 3; k++) posFloats.emplace_back(lf(posFloats[ga * 3 + k], posFloats[gb * 3 + k]));
+        for (int k = 0; k < 3; k++) velFloats.emplace_back(lf(velFloats[ga * 3 + k], velFloats[gb * 3 + k]));
+        for (int k = 0; k < 2; k++) tcFloats.emplace_back(lf(tcFloats[ga * 2 + k], tcFloats[gb * 2 + k]));
+        for (int k = 0; k < 2; k++) tcVelFloats.emplace_back(lf(tcVelFloats[ga * 2 + k], tcVelFloats[gb * 2 + k]));
+        for (int k = 0; k < 4; k++) {
+            float c = lf((float)normColBytes[ga * 4 + k], (float)normColBytes[gb * 4 + k]);
+            int ci = (int)(c + 0.5f);
+            normColBytes.emplace_back((uint8_t)(ci < 0 ? 0 : (ci > 255 ? 255 : ci)));
+        }
+        // Both endpoints of an F5 tri come from one setVertex batch, so they share the same
+        // transform/light/fog indices; copy them from ga (they equal gb's).
+        viewProjIndices.emplace_back(viewProjIndices[ga]);
+        worldIndices.emplace_back(worldIndices[ga]);
+        fogIndices.emplace_back(fogIndices[ga]);
+        lightIndices.emplace_back(lightIndices[ga]);
+        lightCounts.emplace_back(lightCounts[ga]);
+        lookAtIndices.emplace_back(lookAtIndices[ga]);
+
+        // Clip-space lerp equals the model-space lerp's transform (MVP affine); posScreen from it.
+        const hlslpp::float4 pt = posTransformed[ga] + (posTransformed[gb] - posTransformed[ga]) * t;
+        posTransformed.emplace_back(pt);
+        const interop::RSPViewport &viewport = viewportStack[viewportStackSize - 1];
+        posScreen.emplace_back((pt.xyz / hlslpp::float3(pt.w, -pt.w, pt.w)) * viewport.scale + viewport.translate);
+        return newIndex;
+    }
+
     void RSP::modifyVertex(uint16_t dstIndex, uint16_t dstAttribute, uint32_t value) {
         if (dstIndex >= RSP_MAX_VERTICES) {
             assert(false && "Vertex index is not valid. DL is possibly corrupted.");
@@ -1047,12 +1094,23 @@ namespace RT64 {
         const uint32_t cycleType = state->rdp->otherMode.cycleType();
         assert(cycleType != G_CYC_COPY);
 
-        // Don't draw anything if both tris are being culled.
         const uint32_t &geometryMode = geometryModeStack[geometryModeStackSize - 1];
-        if ((geometryMode & cullBothMask) == cullBothMask) {
+        // Factor 5 cull semantics: both cull bits set (G_CULL_BOTH) means DOUBLE-SIDED, not "draw
+        // nothing". The skybox dome is submitted this way and viewed from the inside; both faces must
+        // draw (no CPU backface test here, no GPU cull in rt64_state) so every presented region is
+        // covered by real dome pixels. Dropping it via the F3DEX cull-both early-out left the sky black.
+        // ROGUESQ_F5_CULLBOTH_DRAW=0 restores the old drop-everything behavior for A/B.
+        // (Superseded when f5Cull: the ucode's cull test only honors 0x2000 and ignores 0x1000, so
+        // both bits = back-face cull; the double-sided path stays as the ROGUESQ_F5_CULL=0 fallback.)
+        static int s_cullbothdraw = -1; if (s_cullbothdraw < 0) { const char* e = std::getenv("ROGUESQ_F5_CULLBOTH_DRAW"); s_cullbothdraw = (e && e[0] == '0') ? 0 : 1; }
+        const bool doubleSided = !f5Cull && s_cullbothdraw && (geometryMode & cullBothMask) == cullBothMask;
+        if (!f5Cull && !s_cullbothdraw && (geometryMode & cullBothMask) == cullBothMask) {
             return;
         }
-        
+        const uint32_t cullTestMask = f5Cull ? (cullBothMask & ~cullFrontMask) : cullBothMask;
+        // ROGUESQ_SKY_NOCULL=1: A/B — disable ALL per-tri backface culling.
+        static int s_nocull = -1; if (s_nocull < 0) { const char* e = std::getenv("ROGUESQ_SKY_NOCULL"); s_nocull = (e && e[0] == '1') ? 1 : 0; }
+
         state->rdp->checkFramebufferPair();
         
         // We must add the current projection again if we're not in the right state.
@@ -1084,7 +1142,7 @@ namespace RT64 {
         const bool computeSmoothNormals = !usesLighting;
 
         // Swap the indices around if and only if front face culling is enabled.
-        if ((geometryMode & cullBothMask) == cullFrontMask) {
+        if (!f5Cull && (geometryMode & cullBothMask) == cullFrontMask) {
             uint8_t swap = c;
             c = a;
             a = swap;
@@ -1112,6 +1170,118 @@ namespace RT64 {
 
         // Indicates the vertex has been used in a tri. Whatever routines modify the vertex afterwards must use a new index instead.
 
+        // Full-frustum CPU clipping (default on; ROGUESQ_F5_NO_NEAR_CLIP=1 disables). RS64's skybox dome
+        // is a small mesh scaled ~25x and wrapped around the camera, so its triangles are gigantic in clip
+        // space (NDC coords in the tens-to-hundreds) and/or cross the near plane (w<=0). Hardware's RSP
+        // clips every triangle to the view frustum before the RDP rasterizes; RT64 hands the GPU the whole
+        // triangle, and coordinates that large overflow the rasterizer guard band -> the triangle is
+        // dropped -> black sky. Fix: Sutherland-Hodgman clip in clip space against the near plane and the
+        // four lateral frustum planes (-w<=x<=w, -w<=y<=w), appending model-space-lerped verts (the GPU CS
+        // re-transform reproduces the exact clipped position because MVP is affine). Triggered only for
+        // triangles that actually leave the guard band (any vertex w<=near, or |x|,|y| > kGuard*w), so
+        // normal on-screen geometry keeps its exact prior path and the GPU guard band handles mild
+        // edge-straddling. Z planes are left alone so RT64's manual depth clamp (which the terrain relies
+        // on) is untouched. See plans/skybox-not-rendering-plan.md.
+        {
+            constexpr float kNearW = 1e-4f;
+            constexpr float kGuard = 2.0f;   // clip only when a vertex leaves this NDC band (GPU guard band is larger)
+            const bool degenerate = (globalIndices[0] == globalIndices[1]) || (globalIndices[1] == globalIndices[2]) || (globalIndices[0] == globalIndices[2]);
+            static int s_clip = -1;
+            if (s_clip < 0) { const char* e = std::getenv("ROGUESQ_F5_NO_NEAR_CLIP"); s_clip = (e && e[0] == '1') ? 0 : 1; }
+
+            bool extreme = false;
+            if (s_clip && !degenerate) {
+                for (int i = 0; i < 3; i++) {
+                    const hlslpp::float4 p = workload.drawData.posTransformed[globalIndices[i]];
+                    const float pw = p.w, px = p.x, py = p.y;
+                    if (pw <= kNearW) { extreme = true; break; }
+                    const float apx = px < 0.0f ? -px : px;
+                    const float apy = py < 0.0f ? -py : py;
+                    if (apx > kGuard * pw || apy > kGuard * pw) { extreme = true; break; }
+                }
+            }
+
+            if (extreme) {
+                // Signed distance to each clip plane (inside when >= 0) for a clip-space pos p.
+                auto planeDist = [kNearW](const hlslpp::float4 &p, int plane) -> float {
+                    const float x = p.x, y = p.y, w = p.w;
+                    switch (plane) {
+                        case 0:  return w - kNearW; // near   w >= kNearW
+                        case 1:  return w + x;      // left   x >= -w
+                        case 2:  return w - x;      // right  x <=  w
+                        case 3:  return w + y;      // bottom y >= -w
+                        default: return w - y;      // top    y <=  w
+                    }
+                };
+                uint32_t poly[10];
+                poly[0] = globalIndices[0]; poly[1] = globalIndices[1]; poly[2] = globalIndices[2];
+                int polyN = 3;
+                for (int pl = 0; pl < 5 && polyN > 0; pl++) {
+                    uint32_t out[10];
+                    int outCnt = 0;
+                    for (int i = 0; i < polyN; i++) {
+                        const uint32_t gA = poly[i];
+                        const uint32_t gB = poly[(i + 1) % polyN];
+                        const float dA = planeDist(workload.drawData.posTransformed[gA], pl);
+                        const float dB = planeDist(workload.drawData.posTransformed[gB], pl);
+                        const bool inA = dA >= 0.0f;
+                        const bool inB = dB >= 0.0f;
+                        if (inA && outCnt < 10) out[outCnt++] = gA;
+                        if ((inA != inB) && outCnt < 10) {
+                            const float t = dA / (dA - dB);
+                            out[outCnt++] = appendClippedVertex(gA, gB, t);
+                        }
+                    }
+                    polyN = outCnt;
+                    for (int i = 0; i < polyN; i++) poly[i] = out[i];
+                }
+                // appendClippedVertex reallocated the drawData vectors; access them fresh (the outer
+                // faceIndices/worldIndices/posScreen/tcFloats references may now dangle).
+                auto &fFaceIndices = workload.drawData.faceIndices;
+                auto &fWorldIndices = workload.drawData.worldIndices;
+                auto &fPosScreen = workload.drawData.posScreen;
+                auto &fTcFloats = workload.drawData.tcFloats;
+                const bool usesCulling = !s_nocull && !doubleSided && (geometryMode & cullTestMask);
+                const FixedRect &scissorRect = state->rdp->scissorRectStack[state->rdp->scissorStackSize - 1];
+                for (int f = 1; f + 1 < polyN; f++) {
+                    const uint32_t gg[3] = { poly[0], poly[f], poly[f + 1] };
+                    for (int i = 0; i < 3; i++) {
+                        state->rdp->updateCallTexcoords(fTcFloats[gg[i] * 2 + 0], fTcFloats[gg[i] * 2 + 1]);
+                        fFaceIndices.push_back(gg[i]);
+                        minMatrix = std::min(minMatrix, fWorldIndices[gg[i]]);
+                        maxMatrix = std::max(maxMatrix, fWorldIndices[gg[i]]);
+                    }
+                    bool visibleTri = true;
+                    if (usesCulling) {
+                        const hlslpp::float3 U = fPosScreen[gg[1]] - fPosScreen[gg[0]];
+                        const hlslpp::float3 V = fPosScreen[gg[2]] - fPosScreen[gg[0]];
+                        const hlslpp::float3 N = hlslpp::cross(V, U);
+                        visibleTri = (N.z >= 0.0f);
+                    }
+                    if (visibleTri && !scissorRect.isNull()) {
+                        fbPair.scissorRect.merge(scissorRect);
+                        FixedRect drawRect;
+                        for (int i = 0; i < 3; i++) {
+                            const hlslpp::float3 &v = fPosScreen[gg[i]];
+                            drawRect.ulx = std::min(drawRect.ulx, int32_t(v[0] * 4.0f));
+                            drawRect.uly = std::min(drawRect.uly, int32_t(v[1] * 4.0f));
+                            drawRect.lrx = std::max(drawRect.lrx, int32_t(hlslpp::ceil(v.x).x * 4.0f));
+                            drawRect.lry = std::max(drawRect.lry, int32_t(hlslpp::ceil(v.y).x * 4.0f));
+                        }
+                        drawRect = scissorRect.intersection(drawRect);
+                        if (!drawRect.isNull()) {
+                            fbPair.drawColorRect.merge(drawRect);
+                            if (otherModeStack[otherModeStackSize - 1].zUpd()) {
+                                fbPair.drawDepthRect.merge(drawRect);
+                            }
+                        }
+                    }
+                    drawCall.triangleCount++;
+                }
+                return;
+            }
+        }
+
         for (int i = 0; i < 3; i++) {
             // TODO: Figure out how to handle texcoord tracking on TEXGEN cases.
             const uint32_t globalIndex = globalIndices[i];
@@ -1121,9 +1291,24 @@ namespace RT64 {
             maxMatrix = std::max(maxMatrix, worldIndices[globalIndex]);
         }
 
+        // A vertex with clip-space w <= 0 (at/behind the camera) makes its perspective-divided
+        // posScreen garbage (divide by <= 0), corrupting both the backface-cull normal and the
+        // posScreen-derived drawRect below. The GPU still rasterizes and near-plane-clips these tris
+        // correctly (RSPProcessCS keeps w, RasterVS reconstructs clip space), so the only breakage is
+        // this CPU present-region bookkeeping: a garbage/null drawColorRect drops the tri's region
+        // from presentation and RDRAM writeback. Detect the case from the correct clip-space w in
+        // posTransformed and fall back to the full scissor. Fixes camera-wrapping geometry whose tris
+        // span the near plane (e.g. the RS64 skybox dome), which was invisible while all-positive-w
+        // scene geometry rendered fine.
+        const auto &posTransformed = workload.drawData.posTransformed;
+        const float w0 = posTransformed[globalIndices[0]].w;
+        const float w1 = posTransformed[globalIndices[1]].w;
+        const float w2 = posTransformed[globalIndices[2]].w;
+        const bool nearCrossing = (w0 <= 0.0f) || (w1 <= 0.0f) || (w2 <= 0.0f);
+
         bool visibleTri = true;
-        const bool usesCulling = geometryMode & cullBothMask;
-        if (usesCulling) {
+        const bool usesCulling = !s_nocull && !doubleSided && (geometryMode & cullTestMask);
+        if (usesCulling && !nearCrossing) {
             const hlslpp::float3 U = posScreen[globalIndices[1]] - posScreen[globalIndices[0]];
             const hlslpp::float3 V = posScreen[globalIndices[2]] - posScreen[globalIndices[0]];
             const hlslpp::float3 N = hlslpp::cross(V, U);
@@ -1135,15 +1320,20 @@ namespace RT64 {
             fbPair.scissorRect.merge(scissorRect);
 
             FixedRect drawRect;
-            for (int i = 0; i < 3; i++) {
-                const hlslpp::float3 &v = posScreen[globalIndices[i]];
-                drawRect.ulx = std::min(drawRect.ulx, int32_t(v[0] * 4.0f));
-                drawRect.uly = std::min(drawRect.uly, int32_t(v[1] * 4.0f));
-                drawRect.lrx = std::max(drawRect.lrx, int32_t(hlslpp::ceil(v.x).x * 4.0f));
-                drawRect.lry = std::max(drawRect.lry, int32_t(hlslpp::ceil(v.y).x * 4.0f));
+            if (nearCrossing) {
+                // posScreen unusable; the GPU-clipped tri can land anywhere in the scissor.
+                drawRect = scissorRect;
             }
-
-            drawRect = scissorRect.intersection(drawRect);
+            else {
+                for (int i = 0; i < 3; i++) {
+                    const hlslpp::float3 &v = posScreen[globalIndices[i]];
+                    drawRect.ulx = std::min(drawRect.ulx, int32_t(v[0] * 4.0f));
+                    drawRect.uly = std::min(drawRect.uly, int32_t(v[1] * 4.0f));
+                    drawRect.lrx = std::max(drawRect.lrx, int32_t(hlslpp::ceil(v.x).x * 4.0f));
+                    drawRect.lry = std::max(drawRect.lry, int32_t(hlslpp::ceil(v.y).x * 4.0f));
+                }
+                drawRect = scissorRect.intersection(drawRect);
+            }
             if (!drawRect.isNull()) {
                 fbPair.drawColorRect.merge(drawRect);
                 if (otherModeStack[otherModeStackSize - 1].zUpd()) {
@@ -1287,6 +1477,20 @@ namespace RT64 {
 
     void RSP::setGBI(GBI *gbi) {
         NoN = gbi->flags.NoN;
+        // ROGUESQ_F5_NON=1: force NoN (near-plane clip OFF, far-plane manual clamp) for the Factor 5
+        // ucode. F5 uniquely ships NoN=false, so depthClipEnabled=true turns on a GPU hard near-plane
+        // clip that discards large geometry as it approaches the camera ("culled/worse up close").
+        // Opt-in A/B while validating; off = current behavior.
+        if (gbi->ucode == GBIUCode::F3DFACTOR5) {
+            static int s_f5non = -1;
+            if (s_f5non < 0) { const char* e = std::getenv("ROGUESQ_F5_NON"); s_f5non = (e && e[0] && e[0] != '0') ? 1 : 0; }
+            if (s_f5non) NoN = true;
+            static int s_f5cull = -1;
+            if (s_f5cull < 0) { const char* e = std::getenv("ROGUESQ_F5_CULL"); s_f5cull = (e && e[0] == '0') ? 0 : 1; }
+            f5Cull = s_f5cull != 0;
+        } else {
+            f5Cull = false;
+        }
         cullBothMask = gbi->constants[F3DENUM::G_CULL_BOTH];
         cullFrontMask = gbi->constants[F3DENUM::G_CULL_FRONT];
         projMask = gbi->constants[F3DENUM::G_MTX_PROJECTION];

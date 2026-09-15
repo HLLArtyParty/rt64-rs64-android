@@ -588,7 +588,10 @@ namespace RT64 {
 #endif
 
     bool Application::sdlEventFilter(SDL_Event *event) {
-        if (userConfig.developerMode && (presentQueue != nullptr) && (state != nullptr) && !FileDialog::isOpen) {
+        // Forward events to ImGui when the inspector is up for developer mode OR
+        // when a host ImGui hook is registered (the game-facing controls UI runs
+        // without developer mode).
+        if ((userConfig.developerMode || GetRenderHookImgui() != nullptr) && (presentQueue != nullptr) && (state != nullptr) && !FileDialog::isOpen) {
             const std::lock_guard lock(presentQueue->inspectorMutex);
             if ((presentQueue->inspector != nullptr) && presentQueue->inspector->handleSdlEvent(event)) {
                 return true;
@@ -619,7 +622,26 @@ namespace RT64 {
     }
 
     bool Application::usesWindowMessageFilter() {
-        return userConfig.developerMode;
+        return userConfig.developerMode || (GetRenderHookImgui() != nullptr);
+    }
+
+    void Application::ensureHostInspector() {
+        // Create the inspector (ImGui context + backend) without developer mode
+        // so a registered host ImGui hook has a frame to draw into. In developer
+        // mode the F1 shortcut manages the inspector instead.
+        if (userConfig.developerMode || GetRenderHookImgui() == nullptr) {
+            return;
+        }
+        if (presentQueue == nullptr) {
+            return;
+        }
+        const std::lock_guard lock(presentQueue->inspectorMutex);
+        if (presentQueue->inspector == nullptr) {
+            presentQueue->inspector = std::make_unique<Inspector>(device.get(), swapChain.get(), chosenGraphicsAPI, appWindow->sdlWindow);
+            if (!userPaths.isEmpty()) {
+                presentQueue->inspector->setIniPath(userPaths.imguiPath);
+            }
+        }
     }
 
     void Application::processDeveloperShortcut(DeveloperShortcut developerShortcut) {

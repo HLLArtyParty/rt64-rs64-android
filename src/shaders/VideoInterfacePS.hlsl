@@ -14,7 +14,22 @@ float4 SampleInput(float2 uv) {
     const float2 LowerRight = gConstants.videoResolution / gConstants.textureResolution;
     const float2 HalfPixel = float2(0.5f, 0.5f) / gConstants.textureResolution;
     float2 outsideBorder = step(LowerRight, uv);
-    float4 sampledColor = gInput.SampleLevel(gSampler, clamp(uv, HalfPixel, LowerRight - HalfPixel), 0);
+    float2 cuv = clamp(uv, HalfPixel, LowerRight - HalfPixel);
+    float4 sampledColor;
+    // N64 VI-style soften: when viFilter > 0, average a plus-shaped tent around the sample point at a
+    // color-target-texel radius. Approximates the console VI's de-dither/AA blur that softens surfaces
+    // (the game point-samples faithfully; hardware softens the whole frame at scan-out). 0 = untouched.
+    if (gConstants.viFilter > 0.0f) {
+        float2 t = gConstants.viFilter / gConstants.textureResolution;
+        float4 acc = gInput.SampleLevel(gSampler, cuv, 0) * 4.0f;
+        acc += gInput.SampleLevel(gSampler, clamp(cuv + float2(t.x, 0.0f), HalfPixel, LowerRight - HalfPixel), 0) * 2.0f;
+        acc += gInput.SampleLevel(gSampler, clamp(cuv - float2(t.x, 0.0f), HalfPixel, LowerRight - HalfPixel), 0) * 2.0f;
+        acc += gInput.SampleLevel(gSampler, clamp(cuv + float2(0.0f, t.y), HalfPixel, LowerRight - HalfPixel), 0) * 2.0f;
+        acc += gInput.SampleLevel(gSampler, clamp(cuv - float2(0.0f, t.y), HalfPixel, LowerRight - HalfPixel), 0) * 2.0f;
+        sampledColor = acc / 12.0f;
+    } else {
+        sampledColor = gInput.SampleLevel(gSampler, cuv, 0);
+    }
     float4 gammaCorrectedColor = pow(sampledColor, gConstants.gamma);
     gammaCorrectedColor.rgb *= max(1.0f - outsideBorder.x - outsideBorder.y, 0.0f);
     gammaCorrectedColor.a = 1.0f;

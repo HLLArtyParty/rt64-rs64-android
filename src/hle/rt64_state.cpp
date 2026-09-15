@@ -21,6 +21,7 @@
 
 #include "rt64_application.h"
 #include "rt64_interpreter.h"
+#include "rhi/rt64_render_hooks.h"
 
 //#define ASSERT_ON_BLENDER_EMULATION
 #define SYNC_ON_EVERY_FB_PAIR 0
@@ -503,7 +504,7 @@ namespace RT64 {
         drawCall.maxWorldMatrix = 0;
         drawCall.triangleCount = 0;
     }
-    
+
     void State::submitFramebufferPair(FramebufferPair::FlushReason flushReason) {
         const int workloadCursor = ext.workloadQueue->writeCursor;
         Workload &workload = ext.workloadQueue->workloads[workloadCursor];
@@ -1005,7 +1006,9 @@ namespace RT64 {
                     flags.upscale2D = forcedUpscale2D || upscaleIfScaledRect;
 
                     if (proj.usesViewport()) {
-                        flags.culling = (callDesc.geometryMode & callDesc.cullBothMask) != 0;
+                        // F5 cull=BOTH means double-sided (draw both faces), not single-face cull.
+                        const uint32_t cullBits = callDesc.geometryMode & callDesc.cullBothMask;
+                        flags.culling = (cullBits != 0) && (cullBits != callDesc.cullBothMask);
                         flags.smoothShade = (callDesc.geometryMode & callDesc.shadingSmoothMask) != 0;
                         flags.NoN = callDesc.NoN;
                     }
@@ -1679,6 +1682,11 @@ namespace RT64 {
         lastWorkloadIndex = ext.workloadQueue->writeCursor;
         if (ext.userConfig->developerMode) {
             inspect();
+        } else if (GetRenderHookImgui() != nullptr) {
+            // Host-facing ImGui UI (controls/rebind) without developer mode:
+            // create the inspector once, then run a host-only ImGui frame.
+            ext.app->ensureHostInspector();
+            inspect();
         }
 
         // Add any lights to the workload from the presets that are activated.
@@ -2171,6 +2179,22 @@ namespace RT64 {
         Workload &workload = ext.workloadQueue->workloads[lastWorkloadIndex];
         InspectorMode inspectorMode = InspectorMode::None;
         inspector->newFrame(ext.framebufferGraphicsWorker);
+
+        // Host ImGui hook (e.g. the controls/rebind window). Runs between
+        // NewFrame and draw() so host windows composite with the inspector.
+        if (RenderHookImgui *hostImgui = GetRenderHookImgui()) {
+            hostImgui();
+        }
+
+        // Without developer mode we only wanted the host ImGui frame; skip the
+        // full developer inspector UI. endFrame() pairs with newFrame() (renders
+        // + releases frameMutex) exactly as the dev path does at its end, so the
+        // next newFrame() doesn't deadlock; draw() then renders the frame.
+        if (!ext.userConfig->developerMode) {
+            inspector->endFrame();
+            ext.presentQueue->inspectorMutex.unlock();
+            return;
+        }
 
         if (ext.app->freeCamClearQueued) {
             debuggerInspector.camera.enabled = false;

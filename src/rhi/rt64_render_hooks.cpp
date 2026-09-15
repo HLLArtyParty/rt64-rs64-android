@@ -8,6 +8,15 @@ namespace RT64 {
     static RenderHookInit *init = nullptr;
     static RenderHookDraw *draw = nullptr;
     static RenderHookDeinit *deinit = nullptr;
+    static RenderHookImgui *imguiHook = nullptr;
+
+    RenderHookImgui *GetRenderHookImgui() {
+        return imguiHook;
+    }
+
+    void SetRenderHookImgui(RenderHookImgui *imgui) {
+        imguiHook = imgui;
+    }
 
     RenderHookInit *GetRenderHookInit() {
         return init;

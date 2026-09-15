@@ -4,6 +4,9 @@
 
 #include "common/rt64_math.h"
 
+#include <cstdio>
+#include <cstdlib>
+
 #include "rt64_game_frame.h"
 #include "rt64_workload_queue.h"
 

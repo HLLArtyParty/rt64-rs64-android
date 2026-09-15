@@ -4,6 +4,8 @@
 
 #include "rt64_vi_renderer.h"
 
+#include <cstdlib>
+
 #include "shared/rt64_hlsl.h"
 #include "shared/rt64_video_interface.h"
 
@@ -73,10 +75,30 @@ namespace RT64 {
         p.commandList->setViewports(viewport);
         p.commandList->setScissors(scissor);
 
+        // ROGUESQ_VI_FILTER=<radius>: N64 VI-style soften applied in the present pass (VideoInterfacePS).
+        // Radius is in color-target texels (~resolutionScale texels == one native pixel); 0 = off (default,
+        // unchanged behavior). See plans/model-texture VI-filter note; the game point-samples faithfully,
+        // this reintroduces the console's whole-frame softening that RT64 otherwise omits.
+        static const float s_viFilter = []() {
+            const char *v = std::getenv("ROGUESQ_VI_FILTER");
+            return (v && *v) ? float(std::atof(v)) : 0.0f;
+        }();
+
+        // ROGUESQ_VI_GAMMA=<g>: override the present gamma (VideoInterfacePS applies pow(color, gamma)).
+        // The game leaves VI gamma_enable off (VI::gamma()==1.0), so the raw digital framebuffer displays
+        // linearly and looks darker than the game did on real N64 analog/CRT output (proven: our raw FB ==
+        // PJ64 raw FB; ideal-initial.PNG is brighter; gamma 1/2.2 on our FB matches it). A value < 1
+        // brightens (recover shadow detail on model textures); 0/unset keeps the faithful VI gamma.
+        static const float s_gamma = []() {
+            const char *v = std::getenv("ROGUESQ_VI_GAMMA");
+            return (v && *v) ? float(std::atof(v)) : 0.0f;
+        }();
+
         interop::VideoInterfaceCB pushConstants;
         pushConstants.videoResolution = computeHDSize(hlslpp::float2(p.vi->fbSize()), p.resolutionScale, p.downsamplingScale);
         pushConstants.textureResolution = { float(p.textureWidth), float(p.textureHeight) };
-        pushConstants.gamma = p.vi->gamma();
+        pushConstants.gamma = (s_gamma > 0.0f) ? s_gamma : p.vi->gamma();
+        pushConstants.viFilter = s_viFilter;
 
         p.commandList->setPipeline(shader->pipeline.get());
         p.commandList->setGraphicsPipelineLayout(shader->pipelineLayout.get());

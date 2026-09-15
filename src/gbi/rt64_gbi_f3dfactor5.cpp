@@ -22,7 +22,7 @@
 //  - 0x04 / 0x14: vertex batch, n = (w0>>10)&0x3F, 8-byte verts (x,y,z int16, pad).
 //  - 0x02: per-vertex RGBA buffer (4 bytes per vertex, index = vertex index).
 //  - 0xBF: triangle; w1 bytes = indices*5; `w0&2` = 32-byte textured form (indices*5,
-//    indices*4, flags, 3 texcoords 8.8 texels, pad). 0xB4: quad, same 32-byte layout.
+//    indices*4, flags, 3 raw texcoords scaled by 03 82, pad). 0xB4: quad, same 32-byte layout.
 //
 
 #include "rt64_gbi_f3dfactor5.h"
@@ -45,6 +45,7 @@
 #include <utility>
 
 extern "C" volatile unsigned g_most_drawn_fb = 0;
+extern "C" volatile unsigned g_most_drawn_fb_width = 0;  // width of g_most_drawn_fb's color image
 extern "C" volatile unsigned g_f5_task_hops = 0;    // previous task's chunk transitions (diagnostic)
 extern "C" volatile unsigned g_f5_task_faces = 0;   // previous task's emitted faces
 extern "C" volatile int g_explosion_hold = 0;
@@ -73,6 +74,15 @@ namespace RT64 {
         // ROGUESQ_F5_NATIVE=0 turns the geometry emission off (parse-only).
         static bool f5_native_active() {
             static bool s = env_on("ROGUESQ_F5_NATIVE", true);
+            return s;
+        }
+
+        // ROGUESQ_LOG_FACE_UV=1: log every textured F5 face (texture addr, tile
+        // fmt/size, raw + decoded UVs, object-space vertex positions) and every
+        // matrix load. Diagnostic for the rotated/zoomed 3D glyph strip on the
+        // name-entry screen vs the model-texture bug (transform-vs-UV).
+        static bool face_uv_log_enabled() {
+            static bool s = env_on("ROGUESQ_LOG_FACE_UV", false);
             return s;
         }
 
@@ -121,6 +131,7 @@ namespace RT64 {
         static GBIFunction s_inner[UCODE_MAP_SIZE];
         static constexpr int F5_MAX_DEPTH = 64;
         static uint32_t s_task_faces = 0;
+        static uint32_t s_task_budget_trip = 0;
         static void f5_ensure_viewport(State* state);
         // Above the N64's 8 MB (the recomp heap does use 0x71E000; hardware never sees this range; RT64's
         // segmented mask allows 16 MB and the host buffer is 512 MB).
@@ -203,7 +214,14 @@ namespace RT64 {
             const uint32_t off = f5_dl_off(state, dl);
             if (state->displayListCounter != s_chunk_counter) {   // new task: root chunk starts here
                 s_chunk_counter = state->displayListCounter;
-                g_f5_task_hops = s_chunk_hops; g_f5_task_faces = s_task_faces; s_chunk_hops = 0; s_task_faces = 0; s_task_entries = 0; s_hop_n = 0;
+                g_f5_task_hops = s_chunk_hops; g_f5_task_faces = s_task_faces;
+                // ROGUESQ_LOG_GFX_TASK: one line per finished F5 task (faces/entries/hops + whether a
+                // budget cap ended it) to correlate object flicker with dropped geometry.
+                { static bool s_tl = env_on("ROGUESQ_LOG_GFX_TASK", false);
+                  if (s_tl) { std::fprintf(stderr, "[f5-task] done before #%llu: faces=%u entries=%u hops=%u budget_trip=%u\n",
+                      (unsigned long long)s_chunk_counter, s_task_faces, s_task_entries, s_chunk_hops, s_task_budget_trip); std::fflush(stderr); } }
+                s_task_budget_trip = 0;
+                s_chunk_hops = 0; s_task_faces = 0; s_task_entries = 0; s_hop_n = 0;
                 std::memset(s_chunk_base, 0, sizeof(s_chunk_base));
                 std::memset(s_chain_len, 0, sizeof(s_chain_len));
                 s_chunk_base[0] = off;
@@ -224,6 +242,7 @@ namespace RT64 {
             static const uint32_t s_entry_cap = [](){ const char* e = std::getenv("ROGUESQ_F5_ENTRY_CAP"); return (e && *e) ? (uint32_t)std::atoi(e) : 2048u; }();
             static const uint32_t s_face_cap = [](){ const char* e = std::getenv("ROGUESQ_F5_FACE_CAP"); return (e && *e) ? (uint32_t)std::atoi(e) : 4096u; }();
             if (s_task_entries > s_entry_cap || s_task_faces > s_face_cap) {
+                s_task_budget_trip = 1;
                 static int s_n = 0;
                 if (gbi_log_enabled() && ++s_n <= 8) { std::fprintf(stderr, "[gbi-f5] task budget exceeded (entries %u faces %u); ending task\n", s_task_entries, s_task_faces); std::fflush(stderr); }
                 // ROGUESQ_DUMP_ON_BUDGET=<path>: RDRAM snapshot at the first budget trip (walk it offline with
@@ -299,7 +318,7 @@ namespace RT64 {
         // (word index = 8-byte pairs after the command, halves hi/lo):
         //   w1 = (h0,h1)  word2 = (h2,h3)          per-corner heights added to y
         //   word3..word6 = RGBA colors of corners v0,v1,v2,v3
-        //   word7.lo = texcoord size s (8.8 texels)   word8 = (x, y>>4)   word9 = (z, size)
+        //   word7.lo = texcoord span s (S10.5, stored as-is)   word8 = (x, y>>4)   word9 = (z, size)
         //   corners: v0=(x,y+h0,z) v1=(x+size,y+h1,z) v2=(x,y+h2,z+size) v3=(x+size,y+h3,z+size)
         //   UVs: v0 (0,s) v1 (s,s) v2 (0,0) v3 (s,0); tris (v0,v3,v2) (v0,v1,v3), current MVP.
         // The `05 05 00 xx` form DMAs a height/color grid and tessellates it (overlays 0x14/0x18): not yet.
@@ -312,7 +331,7 @@ namespace RT64 {
             const uint32_t w7 = rec[3].w1, w8 = rec[4].w0, w9 = rec[4].w1;
             const int16_t h[4] = { (int16_t)(w1 >> 16), (int16_t)w1, (int16_t)(w2 >> 16), (int16_t)w2 };
             const int32_t x = (int16_t)(w8 >> 16), y = (int32_t)(int16_t)w8 << 4, z = (int16_t)(w9 >> 16), sz = (int16_t)w9;
-            const int16_t s = (int16_t)((int16_t)(w7 & 0xFFFF) / 8);   // 8.8 texels -> s10.5
+            const int16_t s = (int16_t)(w7 & 0xFFFF);   // stored into the vertex as-is by overlay 0x24 (S10.5)
             f5_ensure_viewport(state);
             RSP::Vertex* tmp = reinterpret_cast<RSP::Vertex*>(state->fromRDRAM(F5_VTX_SCRATCH + F5_FACE_SLOT * sizeof(RSP::Vertex)));
             const int32_t px[4] = { x, x + sz, x, x + sz }, pz[4] = { z, z, z + sz, z + sz };
@@ -329,7 +348,7 @@ namespace RT64 {
             s_task_faces += 2;
         }
 
-        // 0x05 `05 05 00 xx` form: a 5x5 SIGNED-height terrain tile (HMP tile height_values[25]).
+        // 0x05 `05 05 00 xx` form: an N*N SIGNED-height terrain tile (HMP tile height_values, N=5 in practice).
         // rec[1].w0 -> 25 s8 heights, rec[1].w1 -> 25 RGBA8888 vertex colors (+ per-tile LOD in low bytes),
         // w7.lo = texcoord span, w8/w9 = tile x,y,z,size (same encoding as the flat tile). Heights are the
         // flat s16 heights >>4, so worldY = base + h*16 (ROGUESQ_F5_TERRAIN_HSCALE multiplies). The 5x5 is
@@ -340,11 +359,21 @@ namespace RT64 {
             if (!s_grid) return;
             static float s_hmul = 1.0f; static int s_hmul_set = 0;   // extra user tuning multiplier (rerogue-derived coeff = 1.0)
             if (!s_hmul_set) { s_hmul_set = 1; const char* v = std::getenv("ROGUESQ_F5_TERRAIN_HSCALE"); if (v && *v) s_hmul = (float)std::atof(v); }
-            const uint32_t hptr = rec[1].w0 & 0x00FFFFFFu;   // 25 s8 heights (5x5)
-            const uint32_t cptr = rec[1].w1 & 0x00FFFFFFu;   // 25 RGBA8888 vertex colors
+            const uint32_t hptr = rec[1].w0 & 0x00FFFFFFu;   // N*N s8 heights
+            const uint32_t cptr = rec[1].w1 & 0x00FFFFFFu;   // N*N RGBA8888 vertex colors
+            // Parser overlay 0xC: byte1 = N samples per row, byte3 = height stride shift, byte2>>4 = color
+            // LOD shift. Output = M*M samples, M = ((N-1)>>shift)+1, spaced `size` apart (overlay 0x10),
+            // so the tile spans (M-1)*size: far tiles N=5 shift=1 size=256, near N=5 shift=0 size=128.
+            const int gridN = (int)((rec[0].w0 >> 16) & 0xFF) > 1 ? (int)((rec[0].w0 >> 16) & 0xFF) : 5;
+            const int shift = (int)(rec[0].w0 & 0xFF) & 7;
+            const int M = ((gridN - 1) >> shift) + 1;
             const uint32_t w7 = rec[3].w1, w8 = rec[4].w0, w9 = rec[4].w1;
             const int32_t x = (int16_t)(w8 >> 16), y = (int32_t)(int16_t)w8 << 4, z = (int16_t)(w9 >> 16), sz = (int16_t)w9;
-            const int16_t s = (int16_t)((int16_t)(w7 & 0xFFFF) / 8);   // 8.8 texels -> s10.5
+            // Overlay 0x10: s += w7.lo per sample along x, t = w7.lo*(M-1) - w7.lo*j along z (S10.5, no scale).
+            const int16_t s = (int16_t)(w7 & 0xFFFF);
+            const float span = (float)((M - 1) * sz);          // tile extent in world units
+            const float step5 = span / 4.0f;                    // world units per 5x5-space cell
+            const float uvcell = (float)s * (float)(M - 1) / 4.0f;   // S10.5 per 5x5-space cell
             const uint8_t* ram = state->RDRAM;
             // Grid heights are the flat-tile s16 heights compressed to s8 (>>4): flat corner heights run
             // 544..2032, grid s8 run 31..110, ratio ~16. So grid worldY = h<<4 to seat against flat tiles
@@ -352,7 +381,18 @@ namespace RT64 {
             const float hcoeff = 16.0f * s_hmul;
             f5_ensure_viewport(state);
             int8_t H[25];
-            for (int k = 0; k < 25; ++k) H[k] = (int8_t)ram[(hptr + (uint32_t)k) ^ 3];
+            // Resample the N*N height grid onto the 5x5 the mesh below is built from (nearest for N != 5).
+            for (int r = 0; r < 5; ++r) for (int c = 0; c < 5; ++c) {
+                const int gr = (gridN == 5) ? r : (int)(r * (gridN - 1) / 4.0f + 0.5f), gc = (gridN == 5) ? c : (int)(c * (gridN - 1) / 4.0f + 0.5f);
+                H[r * 5 + c] = (int8_t)ram[(hptr + (uint32_t)(gr * gridN + gc)) ^ 3];
+            }
+            // ROGUESQ_LOG_GFX_TASK: trace near-LOD (shift 0) and blended tiles to catch transition garbage.
+            { static bool s_lg = env_on("ROGUESQ_LOG_GFX_TASK", false); static int s_n = 0;
+              const uint32_t w5 = rec[2].w1 & 0xFFFF, w6 = rec[3].w0 & 0xFFFF;
+              if (s_lg && (shift == 0 || w5 || w6) && ++s_n <= 300) {
+                  int hmin = 127, hmax = -128; for (int k = 0; k < 25; ++k) { if (H[k] < hmin) hmin = H[k]; if (H[k] > hmax) hmax = H[k]; }
+                  std::fprintf(stderr, "[f5-tile] task=%llu x=%d y=%d z=%d size=%d N=%d shift=%d w5=%04X w6=%04X hptr=%06X h=[%d,%d]" "\n",
+                      (unsigned long long)state->displayListCounter, x, y, z, sz, gridN, shift, w5, w6, hptr, hmin, hmax); std::fflush(stderr); } }
             // Stitch to flat neighbors: a grid edge facing a coarse (flat-rendered) neighbor must be a
             // straight line between its corners, else its subdivided intermediate verts T-junction with the
             // flat quad. Detect flat vs grid neighbors from the level tile grid (D_80136DC0): grid cells have
@@ -365,7 +405,7 @@ namespace RT64 {
                     auto rd16 = [&](uint32_t a){ return (uint32_t)((ram[a^3]<<8)|ram[(a+1)^3]); };
                     const uint32_t idxArr = rd32(0x136DC0) & 0x00FFFFFFu, tileData = rd32(0x136DC4) & 0x00FFFFFFu;
                     const uint32_t gw = rd16(0x136DF8), gh = rd16(0x136DFA);   // hdr +0x38 width, +0x3A height
-                    const int csz = sz * 2;                                    // tile world spacing = 2*size
+                    const int csz = (int)span;                                 // tile world spacing
                     if (idxArr > 0x1000 && idxArr < RDRAMSize && tileData > 0x1000 && tileData < RDRAMSize &&
                         gw > 0 && gw <= 256 && gh > 0 && gh <= 256 && csz > 0) {
                         static uint32_t s_idxArr = 0; static int s_ox = 0, s_oz = 0; static bool s_ook = false;
@@ -389,8 +429,8 @@ namespace RT64 {
             }
             // Subdivision: the ucode (overlay 0x14) subdivides the 5x5 into a finer interpolated mesh for
             // smooth slopes; raw 5x5 quads look faceted. Bilinear-interpolate to (4*S+1)^2 verts. S from env
-            // (per-tile LOD lives in w1 low bytes; uniform S avoids inter-tile cracks). Grid tiles span 2*size
-            // (per sample-cell = size/2); UV spans the tile over the 4 sample-cells; color grid is coarse
+            // (per-tile LOD lives in w1 low bytes; uniform S avoids inter-tile cracks). Grid tiles span (M-1)*size
+            // (step5 per 5x5 cell); UV spans the tile over the 4 cells; colors are read at the hardware stride
             // (real values at even samples, odd are checkerboard filler) so sample the nearest even cell.
             static int s_sub = -1;
             if (s_sub < 0) { const char* v = std::getenv("ROGUESQ_F5_TERRAIN_SUB"); s_sub = (v && *v) ? std::atoi(v) : 2; if (s_sub < 1) s_sub = 1; if (s_sub > 4) s_sub = 4; }
@@ -410,13 +450,15 @@ namespace RT64 {
                     h = ((float)H[y0*5+x0]*(1-tx) + (float)H[y0*5+x0+1]*tx) * (1-ty)
                       + ((float)H[(y0+1)*5+x0]*(1-tx) + (float)H[(y0+1)*5+x0+1]*tx) * ty;
                 }
-                v.x = (int16_t)(x + (int32_t)(fx * (float)sz * 0.5f));
+                v.x = (int16_t)(x + (int32_t)(fx * step5));
                 v.y = (int16_t)(y + (int32_t)(h * hcoeff));
-                v.z = (int16_t)(z + (int32_t)(fy * (float)sz * 0.5f));
-                v.flag = 0; v.s = (int16_t)(s * fx / 4.0f); v.t = (int16_t)(s * fy / 4.0f);
-                int cx = ((int)(fx + 0.5f)) & ~1, cy = ((int)(fy + 0.5f)) & ~1;
-                if (cx > 4) cx = 4; if (cy > 4) cy = 4;
-                const uint32_t cb = cptr + (uint32_t)(cy * 5 + cx) * 4;
+                v.z = (int16_t)(z + (int32_t)(fy * step5));
+                v.flag = 0; v.s = (int16_t)(uvcell * fx); v.t = (int16_t)(uvcell * (4.0f - fy));
+                // Colors: hardware reads every (1<<shift)-th sample of the N*N color grid.
+                const int cstep = 1 << shift;
+                int cx = (int)((fx * (gridN - 1) / 4.0f) / cstep + 0.5f) * cstep, cy = (int)((fy * (gridN - 1) / 4.0f) / cstep + 0.5f) * cstep;
+                if (cx > gridN - 1) cx = gridN - 1; if (cy > gridN - 1) cy = gridN - 1;
+                const uint32_t cb = cptr + (uint32_t)(cy * gridN + cx) * 4;
                 v.color.r = ram[(cb + 0) ^ 3]; v.color.g = ram[(cb + 1) ^ 3];
                 v.color.b = ram[(cb + 2) ^ 3]; v.color.a = ram[(cb + 3) ^ 3];
             };
@@ -438,6 +480,11 @@ namespace RT64 {
 
         void op_05_record(State* state, DisplayList** dl) {
             const uint32_t w0 = (*dl)->w0;
+            // ROGUESQ_LOG_GFX_TASK: report op-05 headers whose byte1 (samples per row) is not 5, the only
+            // record shape the parser below handles; anything else is walked as an 8-byte command.
+            { static bool s_lg = env_on("ROGUESQ_LOG_GFX_TASK", false); static int s_n = 0;
+              if (s_lg && ((w0 >> 16) & 0xFFu) != 0x05u && ++s_n <= 40) {
+                  std::fprintf(stderr, "[f5-op05] unusual header %08X %08X next %08X %08X\n", w0, (*dl)->w1, (*dl)[1].w0, (*dl)[1].w1); std::fflush(stderr); } }
             if (((w0 >> 16) & 0xFFu) != 0x05u) return;      // plain 8-byte command
             if ((w0 >> 8) & 0x2u) f5_tile_quad(state, *dl);   // 05 05 02 = flat tile
             else                  f5_tile_grid(state, *dl);   // 05 05 00 = heightfield grid
@@ -445,7 +492,11 @@ namespace RT64 {
         }
 
         // 0x03: 24 bytes: byte 1 selects a DMEM slot, the next 16 bytes are stored there inline.
-        // 0x80 = viewport (vscale x,y,z,pad, vtrans x,y,z,pad in 2-bit fixed); 0x82 = lookat/light data.
+        // 0x80 = viewport (vscale x,y,z,pad, vtrans x,y,z,pad in 2-bit fixed).
+        // 0x82 = texcoord scale at DMEM 0x140: 4 hi halfwords (s,t,s,t) then 4 lo halfwords, 16.16.
+        // The tri path multiplies each raw per-face UV by it (vmudn lo / vmadh hi) to get S10.5;
+        // the game sends (W-1)/128 per material, so raw UVs are 4.12 normalized, not 8.8 texels.
+        static thread_local int32_t s_tc_scale[2] = { 0, 0 };
         static void f5_set_viewport(State* state, const int16_t* vs, const int16_t* vt);
         void op_03_f5(State* state, DisplayList** dl) {
             const uint32_t sub = ((*dl)->w0 >> 16) & 0xFF;
@@ -454,6 +505,10 @@ namespace RT64 {
                 const int16_t vs[4] = { (int16_t)(a >> 16), (int16_t)a, (int16_t)(b >> 16), (int16_t)b };
                 const int16_t vt[4] = { (int16_t)(c >> 16), (int16_t)c, (int16_t)(d >> 16), (int16_t)d };
                 f5_set_viewport(state, vs, vt);
+            } else if (sub == 0x82) {
+                const uint32_t hi = (*dl)[1].w0, lo = (*dl)[2].w0;
+                s_tc_scale[0] = (int32_t)((hi & 0xFFFF0000u) | (lo >> 16));
+                s_tc_scale[1] = (int32_t)((hi << 16) | (lo & 0xFFFFu));
             }
             (*dl) += 2;
         }
@@ -516,6 +571,28 @@ namespace RT64 {
             if (!f5_native_active()) return;
             f5_ensure_viewport(state);
             state->rsp->matrix(w1, proj ? 0x03 : 0x02);   // F3D constants: PROJECTION=1, LOAD=2
+
+            // ROGUESQ_LOG_FACE_UV: compose the full fixed-point matrix (int part + frac/65536)
+            // and print its top-left 3x3 + translation. A ~90-deg rotation in the upper-left
+            // 2x2 next to a rotated glyph face pins the defect on the transform, not the UVs.
+            if (face_uv_log_enabled()) {
+                static uint64_t s_mtask = ~0ull; static int s_m = 0;
+                if (state->displayListCounter != s_mtask) { s_mtask = state->displayListCounter; s_m = 0; }
+                if (++s_m <= 16) {
+                    float M[16];
+                    for (int i = 0; i < 16; ++i)
+                        M[i] = (float)rd_be_s16(ram, w1 + 2 * i) + (float)rd_be_u16(ram, w1 + 32 + 2 * i) / 65536.0f;
+                    std::fprintf(stderr,
+                        "[face-mtx #%d] %s addr=%06X r0[% .3f % .3f % .3f] r1[% .3f % .3f % .3f] r2[% .3f % .3f % .3f] tr[% .1f % .1f % .1f]\n",
+                        s_m, proj ? "PROJ" : "MDLV", w1 & 0x00FFFFFFu,
+                        M[0], M[1], M[2], M[4], M[5], M[6], M[8], M[9], M[10], M[12], M[13], M[14]);
+                    std::fflush(stderr);
+                }
+            }
+            // F5 frame interpolation is RT64's built-in AUTO geometric matcher (enable via ROGUESQ_RT_INTERP
+            // -> UserConfiguration.refreshRate). Explicit per-object matrixId stamping was tried extensively
+            // (entity-ptr, submit-order queue, mtx_ptr map, address-derived) and all mis-pair -> geometry
+            // warp/flicker: F5 gives no stable deliverable per-object id. AUTO alone is best. See the plan.
         }
 
         // 0x02: per-vertex RGBA staging buffer for the next vertex batch.
@@ -555,8 +632,14 @@ namespace RT64 {
             s_cache_count = n;
         }
 
-        // Emit one face from cache indices. Texcoords are per-face (8.8 texels), so the referenced
-        // vertices are re-emitted into temp slots with their UVs (s10.5 = raw / 8).
+        // raw UV * 16.16 scale -> S10.5, as the ucode's vmudn/vmadh pair (result clamped to int16).
+        static inline int16_t f5_tc_apply(int16_t raw, int32_t scale) {
+            const int64_t v = ((int64_t)raw * (int64_t)scale) >> 16;
+            return (int16_t)(v > 32767 ? 32767 : (v < -32768 ? -32768 : v));
+        }
+
+        // Emit one face from cache indices. Texcoords are per-face, so the referenced vertices are
+        // re-emitted into temp slots with their UVs scaled by the current 03 82 texcoord scale.
         static void f5_emit_face(State* state, const uint32_t* idx, int n, const uint32_t* st, uint32_t colorWord) {
             if (!f5_native_active()) return;
             RSP::Vertex* tmp = reinterpret_cast<RSP::Vertex*>(state->fromRDRAM(F5_VTX_SCRATCH + F5_FACE_SLOT * sizeof(RSP::Vertex)));
@@ -573,8 +656,34 @@ namespace RT64 {
                     tmp[k].color.b = (uint8_t)(c >> 8);  tmp[k].color.a = (uint8_t)c;
                 }
                 if (st) {
-                    tmp[k].s = (int16_t)((int16_t)(st[k] >> 16) / 8);
-                    tmp[k].t = (int16_t)((int16_t)(st[k] & 0xFFFF) / 8);
+                    // ROGUESQ_F5_TC_SCALE=0: legacy raw/8 (treats raw as 8.8 texels; ignores 03 82).
+                    static bool s_scale = env_on("ROGUESQ_F5_TC_SCALE", true);
+                    const int16_t rs = (int16_t)(st[k] >> 16), rt = (int16_t)(st[k] & 0xFFFF);
+                    if (s_scale) {
+                        tmp[k].s = f5_tc_apply(rs, s_tc_scale[0]);
+                        tmp[k].t = f5_tc_apply(rt, s_tc_scale[1]);
+                    } else {
+                        tmp[k].s = (int16_t)(rs / 8);
+                        tmp[k].t = (int16_t)(rt / 8);
+                    }
+                }
+            }
+            // ROGUESQ_LOG_FACE_UV: per textured face, the source texture + tile format + raw/decoded
+            // UVs + object-space vertex positions. Group by tex= to tell the glyph strip from the
+            // X-wing preview; compare UV order vs position order to catch a transposed-UV (rotation).
+            if (st && face_uv_log_enabled()) {
+                static uint64_t s_futask = ~0ull; static int s_fu = 0;
+                if (state->displayListCounter != s_futask) { s_futask = state->displayListCounter; s_fu = 0; }
+                if (++s_fu <= 24) {
+                    const uint32_t texaddr = state->rdp->texture.address & 0x00FFFFFFu;
+                    const LoadTile& T = state->rdp->tiles[0];
+                    std::fprintf(stderr, "[face-uv #%d] n=%d tex=%06X fmt=%u siz=%u line=%u uls=%u lrs=%u |",
+                        s_fu, n, texaddr, T.fmt, T.siz, T.line, T.uls, T.lrs);
+                    for (int k = 0; k < n; ++k)
+                        std::fprintf(stderr, " v%d raw=%08X s=%d t=%d pos=(%d,%d,%d)",
+                            k, st[k], (int)tmp[k].s, (int)tmp[k].t, (int)tmp[k].x, (int)tmp[k].y, (int)tmp[k].z);
+                    std::fprintf(stderr, "\n");
+                    std::fflush(stderr);
                 }
             }
             // Copy cycle type + triangles is undefined on hardware (RT64 asserts): a stale-walk symptom, skip the face.
@@ -619,7 +728,8 @@ namespace RT64 {
                 *dl = state->popReturnAddress();
                 return;
             }
-            const uint32_t idx[4] = { (w1 >> 24) / 5u, ((w1 >> 16) & 0xFF) / 5u, ((w1 >> 8) & 0xFF) / 5u, (w1 & 0xFF) / 5u };
+            // Ucode order: bytes 1,2,3 then byte 0; colors/UVs follow it, tris (0,1,2) (0,2,3).
+            const uint32_t idx[4] = { ((w1 >> 16) & 0xFF) / 5u, ((w1 >> 8) & 0xFF) / 5u, (w1 & 0xFF) / 5u, (w1 >> 24) / 5u };
             // Textured (w0&2) = 32 bytes with a 4-UV block; untextured = 16 bytes, no UVs. Mirrors
             // op_13_quad and the hardware stride: an unconditional 32 reads the next command as bogus UVs
             // AND over-advances 16 bytes, running the walk away on any DL with untextured 0xB4 (proven vs
@@ -638,7 +748,8 @@ namespace RT64 {
         // 0x13: quad variant with the 0xBF framing (4 indices in w1; `w0&2` = UV block).
         void op_13_quad(State* state, DisplayList** dl) {
             const uint32_t w0 = (*dl)->w0, w1 = (*dl)->w1;
-            const uint32_t idx[4] = { (w1 >> 24) / 5u, ((w1 >> 16) & 0xFF) / 5u, ((w1 >> 8) & 0xFF) / 5u, (w1 & 0xFF) / 5u };
+            // Ucode order: bytes 1,2,3 then byte 0; colors/UVs follow it, tris (0,1,2) (0,2,3).
+            const uint32_t idx[4] = { ((w1 >> 16) & 0xFF) / 5u, ((w1 >> 8) & 0xFF) / 5u, (w1 & 0xFF) / 5u, (w1 >> 24) / 5u };
             if (w0 & 0x2) {
                 const uint32_t st[4] = { (*dl)[2].w0, (*dl)[2].w1, (*dl)[3].w0, (*dl)[3].w1 };
                 f5_emit_face(state, idx, 4, st, (*dl)[1].w0);
@@ -657,6 +768,9 @@ namespace RT64 {
             if (sc == 0) sc = 0xFFFF;
             if (tc == 0) tc = 0xFFFF;
             state->rsp->setTexture(tile, level, on, sc, tc);
+            { static int s_ss2 = -1; if (s_ss2 < 0) { const char* e = std::getenv("ROGUESQ_LOG_SKYSEQ"); s_ss2 = (e && e[0] == '1') ? 1 : 0; }
+              const LoadTile &rtt = state->rdp->tiles[tile];
+              if (s_ss2 && rtt.fmt == 0 && rtt.siz == 3) { std::fprintf(stderr, "[skyseq] GTEX tile=%u siz=%u on=%u\n", tile, rtt.siz, on); std::fflush(stderr); } }
         }
 
         // fillRect wrapper kept for the rdpstate module's declaration (op_02 coupling is gone).

@@ -168,6 +168,7 @@ namespace RT64 {
         bool sdlEventFilter(SDL_Event *event) override;
         bool usesWindowMessageFilter() override;
         void processDeveloperShortcut(DeveloperShortcut developerShortcut);
+        void ensureHostInspector();
         void updateUserConfig(bool discardFBs);
         void updateEmulatorConfig();
         void updateEnhancementConfig();
