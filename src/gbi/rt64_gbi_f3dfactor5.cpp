@@ -53,6 +53,7 @@ extern "C" volatile int g_explosion_hold = 0;
 namespace RT64 {
     namespace GBI_F3DFACTOR5 {
         // ---------------------------------------------------------------- gates
+        static GBIFunction s_mw_orig = nullptr;
         static bool env_on(const char* name, bool def) {
             const char* v = std::getenv(name);
             if (!v || !v[0]) return def;
@@ -808,6 +809,32 @@ namespace RT64 {
             gbi->map[0x08] = &op_bf_tri;
             gbi->map[0x09] = &op_consume16;      // BE
             gbi->map[0x0A] = &op_consume16;      // BD
+            // G_MW_FOG (index 8) on this ucode is one signed 16.16 multiplier M, not F3DEX (mul, offset):
+            // the vertex pipeline computes alpha = clamp(z_screen * M * S / 65536, 0, S) with S = 255
+            // (boot code) and offset ~0 (DMEM 0x164 untouched), i.e. 255 everywhere except right at the
+            // near plane. Map to RT64's z/w form with mul = offset = M*255*511/65536 so the visible range
+            // stays saturated like hardware. ROGUESQ_F5_NOFOG=1 drops the word (fog off) for A/B;
+            // ROGUESQ_F5_FOG_RAW=1 passes it through as F3DEX (mul, offset) (old behavior).
+            { static GBIFunction s_mw = gbi->map[0xBC];
+              s_mw_orig = s_mw;
+              gbi->map[0xBC] = +[](State* state, DisplayList** dl) {
+                  static bool s_nofog = env_on("ROGUESQ_F5_NOFOG", false);
+                  static bool s_raw = env_on("ROGUESQ_F5_FOG_RAW", false);
+                  if (((*dl)->w0 & 0xFF) == 8) {
+                      if (s_nofog) return;
+                      static const char* s_force = std::getenv("ROGUESQ_F5_FOG_FORCE");   // "mul,offset"
+                      if (s_force && *s_force) { int fm = 0, fo = 0; std::sscanf(s_force, "%d,%d", &fm, &fo); state->rsp->setFog((int16_t)fm, (int16_t)fo); return; }
+                      if (!s_raw) {
+                          const uint32_t w1 = (*dl)->w1;
+                          const double M = (double)(int16_t)(w1 >> 16) + (double)(w1 & 0xFFFF) / 65536.0;
+                          double k = M * 255.0 * 511.0 / 65536.0;
+                          if (k > 32767.0) k = 32767.0; if (k < -32768.0) k = -32768.0;
+                          state->rsp->setFog((int16_t)k, (int16_t)k);
+                          return;
+                      }
+                  }
+                  s_mw_orig(state, dl);
+              }; }
             gbi->map[0x0B] = gbi->map[0xBC];     // moveword
             gbi->map[0x0C] = &texture_f5;        // BB
             gbi->map[0x0D] = gbi->map[0xBA];
