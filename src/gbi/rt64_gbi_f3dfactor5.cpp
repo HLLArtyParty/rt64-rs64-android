@@ -677,7 +677,7 @@ namespace RT64 {
             // word 2 = per-vertex byte offsets into the op_02 color buffer (v0..v3 in bytes 1,2,3,0)
             const uint32_t cofs[4] = { (colorWord >> 16) & 0xFF, (colorWord >> 8) & 0xFF, colorWord & 0xFF, colorWord >> 24 };
             for (int k = 0; k < n; ++k) {
-                if (idx[k] >= F5_FACE_SLOT || idx[k] >= s_cache_count) { if (st) g_face_idxskip = g_face_idxskip + 1; return; }   // garbage / stale index
+                if (idx[k] >= F5_FACE_SLOT || idx[k] >= s_cache_count) return;   // garbage / stale index
                 tmp[k] = state->rsp->vertices[idx[k]];
                 if (haveColors) {
                     const uint32_t c = rd_be_u32(state->RDRAM, cbuf + cofs[k]);
@@ -716,7 +716,7 @@ namespace RT64 {
                 }
             }
             // Copy cycle type + triangles is undefined on hardware (RT64 asserts): a stale-walk symptom, skip the face.
-            if (state->rdp->otherMode.cycleType() == G_CYC_COPY) { if (st) g_face_copyskip = g_face_copyskip + 1; ++s_task_faces; return; }
+            if (state->rdp->otherMode.cycleType() == G_CYC_COPY) { ++s_task_faces; return; }
             // DIAG (ROGUESQ_LOG_GBI): the filter/cycle a MODEL face actually draws with. Point vs bilerp
             // decides whether models are blocky (point) or smooth. Bounded to the first few faces.
             { static int s_ff = 0; if (gbi_log_enabled() && ++s_ff <= 8) {
@@ -728,18 +728,6 @@ namespace RT64 {
             state->rsp->drawIndexedTri(F5_FACE_SLOT, F5_FACE_SLOT + 1, F5_FACE_SLOT + 2);
             if (n == 4) state->rsp->drawIndexedTri(F5_FACE_SLOT, F5_FACE_SLOT + 2, F5_FACE_SLOT + 3);
             ++s_task_faces;
-            // ROGUESQ_EFFECT_PROBE: count RGBA32 (fmt0 siz3) faces = explosion flipbook quads reaching the GPU.
-            { const LoadTile& T0 = state->rdp->tiles[0]; if (T0.fmt == 0 && T0.siz == 3) g_flipbook_b4_count = g_flipbook_b4_count + 1; }
-            // ROGUESQ_EFFECT_PROBE: log distinct textured-B4 source regions so we can see whether the
-            // explosion textures ever produce a drawn quad reaching the GBI.
-            if (st) { static bool s_on = env_on("ROGUESQ_EFFECT_PROBE", false);
-              if (s_on) { static std::unordered_set<uint32_t> s_seen; const LoadTile& T0 = state->rdp->tiles[0];
-                uint32_t reg = (state->rdp->texture.address & 0x00FFF000u);
-                if (s_seen.size() < 96 && s_seen.insert(reg).second) {
-                  const auto& cc = state->rdp->colorCombinerStack[state->rdp->colorCombinerStackSize - 1];
-                  std::fprintf(stderr, "[emit-tex] region=0x%06X fmt=%u siz=%u combL=0x%08X combH=0x%08X otherL=0x%08X otherH=0x%08X\n",
-                    reg, T0.fmt, T0.siz, cc.L, cc.H, state->rdp->otherMode.L, state->rdp->otherMode.H);
-                  std::fflush(stderr); } } }
         }
 
         // 0xBF: triangle. 16 bytes (cmd, indices*4 + flags); `w0&2` adds 8 bytes = per-face UVs
