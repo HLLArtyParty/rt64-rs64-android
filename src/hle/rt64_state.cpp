@@ -28,6 +28,13 @@
 // rt64_framebuffer_renderer.cpp and rt64_raster_shader_cache.cpp, emitted per submit above).
 std::atomic<unsigned> g_rs64_fg_draws{0}, g_rs64_fg_pipe{0}, g_rs64_fg_uber{0}, g_rs64_fg_variant{0}, g_rs64_fg_pso{0};
 
+// Per-frame RT64 workload accumulators feeding the F5 profiler HUD's RDP slots
+// (no real RDP on the PC path). Summed in State::flush(); read-and-cleared by
+// osDpGetCounters_recomp. tris->white(pipe), draws->magenta(cmd), texloads->green(tmem).
+extern "C" std::atomic<uint32_t> g_rs64_frame_tris{0};
+extern "C" std::atomic<uint32_t> g_rs64_frame_draws{0};
+extern "C" std::atomic<uint32_t> g_rs64_frame_texloads{0};
+
 //#define ASSERT_ON_BLENDER_EMULATION
 #define SYNC_ON_EVERY_FB_PAIR 0
 
@@ -504,6 +511,10 @@ namespace RT64 {
             break;
         };
         
+        g_rs64_frame_tris.fetch_add(drawCall.triangleCount, std::memory_order_relaxed);
+        g_rs64_frame_draws.fetch_add(1, std::memory_order_relaxed);
+        g_rs64_frame_texloads.fetch_add(drawCall.loadCount, std::memory_order_relaxed);
+
         // Reset attributes for the next draw call to be recorded.
         drawCall.rectDsdx = 0;
         drawCall.rectDtdy = 0;

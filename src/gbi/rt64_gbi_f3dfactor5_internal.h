@@ -37,6 +37,9 @@ extern "C" {
     // Framebuffer / phase tracking.
     extern volatile unsigned g_last_swap_fb;    // VI-presented fb (osViSwapBuffer_recomp)
     extern volatile unsigned g_op_bf_count;     // explosion-bloom tri counter (fb-dump trigger)
+    extern volatile unsigned g_flipbook_b4_count;  // ROGUESQ_EFFECT_PROBE: RGBA32 (fmt0 siz3) faces emitted
+    extern volatile unsigned g_face_copyskip;      // ROGUESQ_EFFECT_PROBE: textured faces skipped by G_CYC_COPY
+    extern volatile unsigned g_face_idxskip;       // ROGUESQ_EFFECT_PROBE: textured faces skipped by stale-index
     extern volatile unsigned g_most_drawn_fb;   // heaviest-drawn color image (def in core)
     extern volatile unsigned g_most_drawn_fb_width;  // its color-image width (def in core)
     extern volatile unsigned long long g_most_drawn_fb_ms;  // steady-clock ms of its last texrect (def in core)
