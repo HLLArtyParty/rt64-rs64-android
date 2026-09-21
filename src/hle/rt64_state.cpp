@@ -1049,10 +1049,7 @@ namespace RT64 {
                             // GPU culling is the real cull (the CPU path only swaps winding), so it must follow the
                             // same F5 rule: only the back bit culls. Bit 0x1000 alone is a texcoord flag and never
                             // culls -- front-culling it dropped the radar disc and sweep.
-                            // ROGUESQ_F5_GPU_NOCULL=1: A/B -- disable the real (GPU) cull for every F5 draw.
-                            static int s_gpuNoCull = -1;
-                            if (s_gpuNoCull < 0) { const char *e = std::getenv("ROGUESQ_F5_GPU_NOCULL"); s_gpuNoCull = (e && e[0] == '1') ? 1 : 0; }
-                            flags.culling = !s_gpuNoCull && (cullBits == (callDesc.cullBothMask & ~callDesc.cullFrontMask));
+                            flags.culling = (cullBits == (callDesc.cullBothMask & ~callDesc.cullFrontMask));
                         }
                         else {
                             flags.culling = (cullBits != 0) && (cullBits != callDesc.cullBothMask);

@@ -6,8 +6,6 @@
 
 #include "rt64_buffer_uploader.h"
 
-#include <cstdlib>
-
 namespace RT64 {
     // RSPProcessor
 
@@ -25,10 +23,6 @@ namespace RT64 {
         processCB.vertexCount = drawVertexCount - processCB.vertexStart;
         processCB.prevFrameWeight = p.prevFrameWeight;
         processCB.curFrameWeight = p.curFrameWeight;
-        static int s_farClamp = -1;
-        if (s_farClamp < 0) { const char *e = std::getenv("ROGUESQ_F5_FAR_ZCLAMP"); s_farClamp = (e && e[0] == '0') ? 0 : 1; }
-        processCB.farDepthClamp = uint32_t(s_farClamp);
-        processCB.padding = 0;
         p.outputBuffers->screenPosBuffer.computedSize += processCB.vertexCount * sizeof(float) * 4;
         p.outputBuffers->genTexCoordBuffer.computedSize += processCB.vertexCount * sizeof(float) * 2;
         p.outputBuffers->shadedColBuffer.computedSize += processCB.vertexCount * sizeof(float) * 4;

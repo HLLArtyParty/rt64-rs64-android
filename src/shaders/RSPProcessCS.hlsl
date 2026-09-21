@@ -16,8 +16,6 @@ struct RSPProcessCB {
     uint vertexCount;
     float prevFrameWeight;
     float curFrameWeight;
-    uint farDepthClamp;
-    uint padding;
 };
 
 [[vk::push_constant]] ConstantBuffer<RSPProcessCB> gConstants : register(b0);
@@ -129,12 +127,7 @@ void CSMain(uint vertexIndex : SV_DispatchThreadID) {
     // Convert to N64 screen position.
     const RSPViewport rspViewport = rspViewportVector[viewProjIndex];
     const float3 ndcPos = tfPos.xyz / float3(tfPos.w, -tfPos.w, tfPos.w);
-    float4 screenPos = float4(ndcPos * rspViewport.scale + rspViewport.translate, tfPos.w);
-    // RDP-style far-plane clamp: beyond-far geometry ties at max depth instead of keeping its order.
-    if (gConstants.farDepthClamp != 0) {
-        screenPos.z = min(screenPos.z, rspViewport.translate.z + rspViewport.scale.z);
-    }
-
+    const float4 screenPos = float4(ndcPos * rspViewport.scale + rspViewport.translate, tfPos.w);
     dstPos[vertexOffsetIndex] = screenPos;
     dstTc[vertexOffsetIndex] = tc;
     dstCol[vertexOffsetIndex] = vertexColor;

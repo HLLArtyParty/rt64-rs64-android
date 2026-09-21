@@ -511,7 +511,7 @@ namespace RT64 {
         {
             RSPProcessDescriptorSet descriptorSet;
             layoutBuilder.begin();
-            layoutBuilder.addPushConstant(0, 0, sizeof(uint32_t) * 6, RenderShaderStageFlag::COMPUTE);
+            layoutBuilder.addPushConstant(0, 0, sizeof(uint32_t) * 4, RenderShaderStageFlag::COMPUTE);
             layoutBuilder.addDescriptorSet(descriptorSet);
             layoutBuilder.end();
             rspProcess.pipelineLayout = layoutBuilder.create(device);
