@@ -289,7 +289,19 @@ namespace RT64 {
             const uint32_t target = next & 0x00FFFFFFu;
             // The allocated chunk list is doubly linked: the next chunk's prev word must point back here.
             // A stale call into a recycled chunk otherwise walks the whole free list (thousands of garbage faces).
-            const bool linked = (next >> 24) == 0x80u && target != 0 && target + 0x108u <= RDRAMSize && f5_rd32(state, target + 4) == (0x80000000u | base);
+            const bool fwdValid = (next >> 24) == 0x80u && target != 0 && target + 0x108u <= RDRAMSize;
+            const bool backLinked = fwdValid && f5_rd32(state, target + 4) == (0x80000000u | base);
+            // ROGUESQ_F5_CHUNK_LINK_LOOSE: follow a forward-valid link even when the back-link hasn't been
+            // written yet. In Release the menu overlay chunk's prev word races the gfx walk, so backLinked
+            // is intermittently false and the strict rule ends the DL -> the medal/insignia/preview draws are
+            // dropped. The per-task entry/face budgets + revisit detection remain the free-list-storm backstop.
+            static const bool s_linkLoose = env_on("ROGUESQ_F5_CHUNK_LINK_LOOSE", false);
+            const bool linked = backLinked || (s_linkLoose && fwdValid);
+            // ROGUESQ_F5_LINK_PROBE: log the forward-valid-but-back-link-mismatch case (the overlay-drop signature).
+            { static const bool s_lp = env_on("ROGUESQ_F5_LINK_PROBE", false); static int s_lpn = 0;
+              if (s_lp && fwdValid && !backLinked && ++s_lpn <= 24) {
+                  std::fprintf(stderr, "[f5-link] fwd-valid but bad back-link: base=%06X target=%06X prev=%08X (want %08X)\n",
+                      base, target, f5_rd32(state, target + 4), 0x80000000u | base); std::fflush(stderr); } }
             // Backstop for a stale call into a recycled chunk walking the (also doubly linked) free list.
             // Cap = F5_CHAIN_MAX, the window f5_chunk_revisit can still detect a cycle in. A dense frame
             // legitimately chains ~84 chunks (LucasArts flyover, 359 tiles / 1597 faces); the old cap of 64
@@ -456,6 +468,26 @@ namespace RT64 {
             s_task_faces += 2;
         }
 
+        // Emit N terrain strips (2*(N+1) verts each, laid out contiguously) exactly as the
+        // inline grid loop did: one setVertex + two drawIndexedTri per strip.
+        static void f5_emit_terrain_strips(State* state, const RSP::Vertex* verts, int N) {
+            RSP::Vertex* tmp = reinterpret_cast<RSP::Vertex*>(
+                state->fromRDRAM(F5_VTX_SCRATCH + F5_FACE_SLOT * sizeof(RSP::Vertex)));
+            const uint32_t base = 0x80000000u | (F5_VTX_SCRATCH + F5_FACE_SLOT * sizeof(RSP::Vertex));
+            const int stripVerts = 2 * (N + 1);
+            for (int rr = 0; rr < N; ++rr) {
+                const RSP::Vertex* strip = verts + (size_t)rr * stripVerts;
+                for (int i = 0; i < stripVerts; ++i) tmp[i] = strip[i];
+                state->rsp->setVertex(base, stripVerts, F5_FACE_SLOT);
+                for (int cc = 0; cc < N; ++cc) {
+                    const int v0 = F5_FACE_SLOT + cc, v2 = F5_FACE_SLOT + (N + 1) + cc;
+                    state->rsp->drawIndexedTri(v0, v2 + 1, v2);
+                    state->rsp->drawIndexedTri(v0, v0 + 1, v2 + 1);
+                }
+            }
+            s_task_faces += 2;
+        }
+
         // 0x05 `05 05 00 xx` form: an N*N SIGNED-height terrain tile (HMP tile height_values, N=5 in practice).
         // rec[1].w0 -> 25 s8 heights, rec[1].w1 -> 25 RGBA8888 vertex colors (+ per-tile LOD in low bytes),
         // w7.lo = texcoord span, w8/w9 = tile x,y,z,size (same encoding as the flat tile). Heights are the
@@ -544,10 +576,20 @@ namespace RT64 {
             // (per-tile LOD lives in w1 low bytes; uniform S avoids inter-tile cracks). Grid tiles span (M-1)*size
             // (step5 per 5x5 cell); UV spans the tile over the 4 cells; colors are read at the hardware stride
             // (real values at even samples, odd are checkerboard filler) so sample the nearest even cell.
-            static int s_sub = -1;
-            if (s_sub < 0) { const char* v = std::getenv("ROGUESQ_F5_TERRAIN_SUB"); s_sub = (v && *v) ? std::atoi(v) : 2; if (s_sub < 1) s_sub = 1; if (s_sub > 4) s_sub = 4; }
+            // Distance LOD: the game's own per-tile `shift` is its distance band (0 = near, >=1 = far).
+            // Near tiles keep full subdivision (smooth foreground); far tiles use fewer strips, which is
+            // where the frame-hitch cost lives (op_05 emission scales with strip count). Tile edges are
+            // linearly interpolated, so a finer tile's edge verts stay collinear with a coarser neighbour
+            // -- no geometric crack across an LOD boundary.
+            static int s_sub_near = -1, s_sub_far = -1;
+            if (s_sub_near < 0) {
+                const char* v = std::getenv("ROGUESQ_F5_TERRAIN_SUB"); s_sub_near = (v && *v) ? std::atoi(v) : 2;
+                if (s_sub_near < 1) s_sub_near = 1; if (s_sub_near > 4) s_sub_near = 4;
+                const char* vf = std::getenv("ROGUESQ_F5_TERRAIN_SUB_FAR"); s_sub_far = (vf && *vf) ? std::atoi(vf) : 1;
+                if (s_sub_far < 1) s_sub_far = 1; if (s_sub_far > 4) s_sub_far = 4;
+            }
+            const int s_sub = (shift == 0) ? s_sub_near : s_sub_far;
             const int N = 4 * s_sub;   // cells per axis; N+1 verts per axis; 2*(N+1) <= 34 slots for S<=4
-            RSP::Vertex* tmp = reinterpret_cast<RSP::Vertex*>(state->fromRDRAM(F5_VTX_SCRATCH + F5_FACE_SLOT * sizeof(RSP::Vertex)));
             auto emit_vertex = [&](RSP::Vertex& v, float fx, float fy) {
                 int x0 = (int)fx, y0 = (int)fy; if (x0 > 3) x0 = 3; if (y0 > 3) y0 = 3;
                 const float tx = fx - x0, ty = fy - y0;
@@ -578,20 +620,15 @@ namespace RT64 {
                     v.color.r = out[0]; v.color.g = out[1]; v.color.b = out[2]; v.color.a = out[3];
                 }
             };
-            const uint32_t base = 0x80000000u | (F5_VTX_SCRATCH + F5_FACE_SLOT * sizeof(RSP::Vertex));
+            std::vector<RSP::Vertex> geom((size_t)N * 2 * (N + 1));
             for (int rr = 0; rr < N; ++rr) {   // one 2-row strip at a time
+                RSP::Vertex* strip = geom.data() + (size_t)rr * 2 * (N + 1);
                 for (int cc = 0; cc <= N; ++cc) {
-                    emit_vertex(tmp[cc],           (float)cc / s_sub, (float)rr / s_sub);
-                    emit_vertex(tmp[(N + 1) + cc], (float)cc / s_sub, (float)(rr + 1) / s_sub);
-                }
-                state->rsp->setVertex(base, 2 * (N + 1), F5_FACE_SLOT);
-                for (int cc = 0; cc < N; ++cc) {
-                    const int v0 = F5_FACE_SLOT + cc, v2 = F5_FACE_SLOT + (N + 1) + cc;
-                    state->rsp->drawIndexedTri(v0, v2 + 1, v2);      // (v0,v3,v2)
-                    state->rsp->drawIndexedTri(v0, v0 + 1, v2 + 1);  // (v0,v1,v3)
+                    emit_vertex(strip[cc],           (float)cc / s_sub, (float)rr / s_sub);
+                    emit_vertex(strip[(N + 1) + cc], (float)cc / s_sub, (float)(rr + 1) / s_sub);
                 }
             }
-            s_task_faces += 2;   // count the DL record (runaway guard = ~faces/task), NOT the subdivided tris
+            f5_emit_terrain_strips(state, geom.data(), N);
         }
 
         void op_05_record(State* state, DisplayList** dl) {
@@ -692,6 +729,18 @@ namespace RT64 {
 
         // 0x01: matrix load. byte1 0x03 = projection, 0x02 = modelview; a matrix whose bottom-right
         // element is 0 with a non-zero [2][3] is a projection whatever the byte says.
+        // ROGUESQ_F5_CULL_DIST=<units>: RT64-side per-object distance cull. op_01_matrix sets s_cull_skip
+        // when a model's camera-space origin (modelview translation) exceeds the threshold; the geometry
+        // emitters then drop its setVertex/drawIndexedTri, cutting render-thread draw-recording in dense
+        // scenes. Layered on the game's own LOD, so keep the threshold far to avoid popping submitted
+        // objects. Terrain (op_05, no 0x01) and effect billboards (op_bd) are unaffected. 0 disables.
+        static bool s_cull_skip = false;
+        static float f5_cull_dist2() {
+            static float d2 = -1.0f;
+            if (d2 < -0.5f) { const char* e = std::getenv("ROGUESQ_F5_CULL_DIST"); float d = (e && e[0]) ? (float)std::atof(e) : 0.0f; d2 = (d > 0.0f) ? d * d : 0.0f; }
+            return d2;
+        }
+
         void op_01_matrix(State* state, DisplayList** dl) {
             const uint32_t w0 = (*dl)->w0, w1 = (*dl)->w1;
             const uint32_t addr = state->rsp->fromSegmentedMasked(w1);
@@ -701,6 +750,22 @@ namespace RT64 {
             const bool proj = (((w0 >> 16) & 0xFF) == 0x03) || (m33 == 0 && m23 != 0);
             if (!f5_native_active()) return;
             f5_ensure_viewport(state);
+
+            // Per-object distance cull: evaluate on the modelview load that delimits each object.
+            {
+                const float thr2 = f5_cull_dist2();
+                if (thr2 > 0.0f && !proj) {
+                    const float tx = (float)rd_be_s16(ram, w1 + 2 * 12) + (float)rd_be_u16(ram, w1 + 32 + 2 * 12) / 65536.0f;
+                    const float ty = (float)rd_be_s16(ram, w1 + 2 * 13) + (float)rd_be_u16(ram, w1 + 32 + 2 * 13) / 65536.0f;
+                    const float tz = (float)rd_be_s16(ram, w1 + 2 * 14) + (float)rd_be_u16(ram, w1 + 32 + 2 * 14) / 65536.0f;
+                    s_cull_skip = (tx * tx + ty * ty + tz * tz) > thr2;
+                    { static bool s_lg = env_on("ROGUESQ_F5_CULL_LOG", false); static int s_n = 0;
+                      if (s_lg && (++s_n & 31) == 0) { std::fprintf(stderr, "[f5-cull] dist=%.0f thr=%.0f skip=%d\n",
+                          std::sqrt(tx*tx+ty*ty+tz*tz), std::sqrt(thr2), (int)s_cull_skip); std::fflush(stderr); } }
+                } else {
+                    s_cull_skip = false;
+                }
+            }
 
             // ROGUESQ_F5_SLOT_ID (default off): stamp each per-object modelview with a frame-stable
             // matrixId so RT64 pairs the same object across frames by id (ORDER_LINEAR) instead of
@@ -852,7 +917,7 @@ namespace RT64 {
                 out[i].color.b = (uint8_t)(c >> 8);
                 out[i].color.a = (uint8_t)c;
             }
-            state->rsp->setVertex(0x80000000u | F5_VTX_SCRATCH, n, 0);
+            if (!s_cull_skip) state->rsp->setVertex(0x80000000u | F5_VTX_SCRATCH, n, 0);
             s_cache_count = n;
         }
 
@@ -861,40 +926,15 @@ namespace RT64 {
         // screen-space texrect. First-pass HLE: emit a quad around the cached center (op_04) with the
         // record color + bound texture, GPU-projected. Gated ROGUESQ_F5_SPRITES (off until validated).
         void op_bd_sprite(State* state, DisplayList** dl) {
-            static bool s_on = env_on("ROGUESQ_F5_SPRITES", false);
+            static bool s_on = env_on("ROGUESQ_F5_SPRITES", true);   // F5 billboard sprites (fire/smoke/explosion); ROGUESQ_F5_SPRITES=0 disables
             const uint32_t w0 = (*dl)->w0, w1 = (*dl)->w1;
             if (s_on && f5_native_active()) {
                 const uint32_t slot = ((w0 >> 5) & 0x7F8u) / 0x28u;
                 if (slot < s_cache_count && slot < F5_FACE_SLOT) {
                     const RSP::Vertex* cache = reinterpret_cast<const RSP::Vertex*>(state->fromRDRAM(F5_VTX_SCRATCH));
                     const RSP::Vertex c = cache[slot];
-                    static int s_szset = 0; static int s_size = 0;
-                    if (!s_szset) { s_szset = 1; const char* v = std::getenv("ROGUESQ_F5_SPRITE_SIZE"); s_size = (v && *v) ? std::atoi(v) : 0; }
-                    { static int n=0; ++n; if (env_on("ROGUESQ_F5_SPRITE_LOG", false) && (n<=16)) {
-                        // Decode the fire texture's corner (bg) texel vs a center texel as RGBA16(5551):
-                        // tells us if the black bg is RGB=0 opaque (additive), dark-nonzero, or alpha=0.
-                        const uint32_t tsrc2 = state->rdp->texture.address & 0x00FFFFFFu;
-                        auto rd16 = [&](uint32_t off)->uint16_t { uint32_t a=(tsrc2+off)&0x00FFFFFFu; return (uint16_t)((state->RDRAM[a^3]<<8)|state->RDRAM[(a+1)^3]); };
-                        auto dec = [](uint16_t p, int c[4]){ c[0]=((p>>11)&0x1F)<<3; c[1]=((p>>6)&0x1F)<<3; c[2]=((p>>1)&0x1F)<<3; c[3]=(p&1)*255; };
-                        int bg[4], ct[4]; dec(rd16(0), bg); dec(rd16(40*20*2 + 20*2), ct);
-                        std::fprintf(stderr, "[bd-tex] tex=%06X bgTexel=(%d,%d,%d a=%d) ctrTexel=(%d,%d,%d a=%d)\n",
-                            tsrc2, bg[0],bg[1],bg[2],bg[3], ct[0],ct[1],ct[2],ct[3]);
-                        const auto& vmL = state->rsp->viewMatrixStack[state->rsp->projectionMatrixStackSize - 1];
-                        std::fprintf(stderr, "[bd-view] projStk=%d row0=(%.3f %.3f %.3f) row1=(%.3f %.3f %.3f) | mvp row0=(%.3f %.3f %.3f)\n",
-                            state->rsp->projectionMatrixStackSize,
-                            (float)vmL[0][0],(float)vmL[1][0],(float)vmL[2][0], (float)vmL[0][1],(float)vmL[1][1],(float)vmL[2][1],
-                            (float)state->rsp->modelViewProjMatrix[0][0],(float)state->rsp->modelViewProjMatrix[1][0],(float)state->rsp->modelViewProjMatrix[2][0]);
-                        const LoadTile& T = state->rdp->tiles[0];
-                        const auto& comb = state->rdp->colorCombinerStack[state->rdp->colorCombinerStackSize - 1];
-                        std::fprintf(stderr, "[bd] #%d w0=%08X w1=%08X rec=[%08X %08X] slot=%u center=(%d,%d,%d) | tex=%06X tile[fmt=%u siz=%u uls=%u ult=%u lrs=%u lrt=%u line=%u] combL=%08X combH=%08X otherL=%08X otherH=%08X cimg=%06X\n",
-                            n, w0, w1, (*dl)[1].w0, (*dl)[1].w1, slot, (int)c.x,(int)c.y,(int)c.z,
-                            state->rdp->texture.address & 0x00FFFFFFu, T.fmt, T.siz, T.uls, T.ult, T.lrs, T.lrt, T.line, comb.L, comb.H,
-                            state->rdp->otherMode.L, state->rdp->otherMode.H, state->rdp->colorImage.address & 0x00FFFFFFu);
-                        std::fflush(stderr);
-                    } }
                     int16_t half = (int16_t)((*dl)[1].w1 & 0xFFFFu);   // rec[1] = (S,S) half-size
                     if (half <= 0 || half > 4000) half = 40;
-                    if (s_size) half = (int16_t)s_size;         // ROGUESQ_F5_SPRITE_SIZE override for tuning
                     // UV spans the actual bound tile (lrs/lrt are 10.2 fixed -> +1 texel), S10.5 into the vertex.
                     const LoadTile& T = state->rdp->tiles[0];
                     const int16_t tw = (int16_t)(((T.lrs - T.uls) >> 2) + 1) << 5;
@@ -931,30 +971,35 @@ namespace RT64 {
                         tmp[k].s = us[k]; tmp[k].t = vt[k];
                         tmp[k].color.r = tmp[k].color.g = tmp[k].color.b = tmp[k].color.a = 0xFF;  // white; PRIM carries the color
                     }
-                    // The game's sprite combiner (FC11A7FF) takes alpha from an UNBOUND TEXEL1 -> garbage
-                    // alpha -> the sprite blends with the background. Use the proven MODULATEIA combiner
-                    // (== attribution text: color TEXEL0*PRIM, alpha TEXEL0_a*PRIM_a) + 1-cycle alpha-over,
-                    // and drive the color/fade via PRIM = record w1. ROGUESQ_F5_SPRITE_RAWCOMB keeps the
-                    // game's combiner for A/B.
-                    static bool s_rawcomb = env_on("ROGUESQ_F5_SPRITE_RAWCOMB", false);
-                    // Combiner: COLOR = TEXEL0*PRIM (the game's fire texture is orange; PRIM carries the
-                    // per-sprite tint from the record), ALPHA = TEXEL1*PRIM_a. The game keys the transparent
-                    // background via TEXEL1 (the same fire texture sampled a second time) -> bind tile1=tile0
-                    // so TEXEL1 supplies the alpha mask. (Game's own 2-cycle combiner washes the color to
-                    // white; TEXEL0-alpha in 1-cycle didn't key.) 1-cycle alpha-over. ROGUESQ_F5_SPRITE_RAW=1
-                    // keeps the game's combiner/blend for A/B.
-                    state->rdp->tiles[1] = state->rdp->tiles[0];
-                    static bool s_rawc = env_on("ROGUESQ_F5_SPRITE_RAW", false);
-                    if (!s_rawc) {
-                        // DECAL, 2-cycle (1-cycle can't sample TEXEL1): COLOR = TEXEL0 (the texture's own
-                        // orange, no PRIM to desaturate), ALPHA = TEXEL1 = the same fire texture's alpha =
-                        // the wispy shape, which clips the transparent background. cyc2 passthrough color.
-                        state->rdp->setCombine((uint64_t(0xFFFCFE3Au) << 32) | uint64_t(0x00FFFFFFu));  // color=TEXEL0, alpha=TEXEL1
-                        state->rdp->setOtherMode(0x00180CFFu, 0xC4104A54u | 0x1u);   // 2-cycle alpha-over + test
-                        state->rdp->setBlendColor(0x00000020u);
+                    // Save the RDP state this sprite overrides so it does not leak into the FOLLOWING
+                    // mesh/effect faces. op_bd only restored geometryMode; a leaked zSource=PRIM + primDepth
+                    // (and prim color) collapses the next f5_emit_face quads to the sprite's single depth ->
+                    // explosion-mesh sort artifacts. ROGUESQ_F5_SPRITE_NORESTORE=1 disables (A/B the leak).
+                    static const bool s_norestore = env_on("ROGUESQ_F5_SPRITE_NORESTORE", false);
+                    const uint32_t savedOMH = state->rdp->otherMode.H, savedOML = state->rdp->otherMode.L;
+                    const auto savedPrimD = state->rdp->primDepthStack[state->rdp->primDepthStackSize - 1];
+                    const auto savedPrimC = state->rdp->primColorStack[state->rdp->primColorStackSize - 1];
+                    // Game combine FC11A7FF = color TEXEL0*PRIM, alpha TEXEL1*PRIM_a: TEXEL0 is the light
+                    // RGBA16 puff, TEXEL1 the I8 shape mask, PRIM = record w1 the per-sprite tint + fade.
+                    state->rdp->setPrimColor(0, 0xFF, w1);
+                    // The game blender runs a FOG cycle first (otherL C4104A54); its color tracks the
+                    // scene and washes the sprite. Use the plain non-fog 2-cycle alpha-over the explosion
+                    // geometry uses so the sprite keeps its own color. Z_CMP on / Z_UPD off (0x10 set,
+                    // 0x20 clear) + zSource=PRIM (0x04 set): depth-test the sprite without writing depth.
+                    // The whole quad rasterizes at primDepth (RT64 RasterVS), so set primDepth to the
+                    // center's own projected NDC depth below -- otherwise the sprite inherits a STALE
+                    // primDepth from the last DL command (near on the first cinematic pass, far after the
+                    // attract demo runs) which is the loop-dependent "behind terrain" bug.
+                    // ROGUESQ_F5_SPRITE_NODEPTH=1 restores the no-depth-test band-aid for A/B.
+                    static const bool s_nodepth = env_on("ROGUESQ_F5_SPRITE_NODEPTH", false);
+                    state->rdp->setOtherMode(state->rdp->otherMode.H, s_nodepth ? 0x00504A44u : 0x00504A54u);
+                    {
+                        const float clipZ = c.x*(float)mv[0][2] + c.y*(float)mv[1][2] + c.z*(float)mv[2][2] + (float)mv[3][2];
+                        const float clipW = c.x*(float)mv[0][3] + c.y*(float)mv[1][3] + c.z*(float)mv[2][3] + (float)mv[3][3];
+                        float ndcZ = (clipW > 1e-4f) ? (clipZ / clipW) : 1.0f;
+                        ndcZ = ndcZ < 0.0f ? 0.0f : (ndcZ > 1.0f ? 1.0f : ndcZ);
+                        state->rdp->setPrimDepth((uint16_t)(ndcZ * 32767.0f), 0);
                     }
-                    { static int t = -1; if (t < 0) { const char* v = std::getenv("ROGUESQ_F5_SPRITE_PRIM"); t = (v && *v) ? (int)strtoul(v, nullptr, 0) : -2; }
-                      state->rdp->setPrimColor(0, 0xFF, (t >= 0) ? (uint32_t)t : w1); }
                     // Billboards are UNLIT (hw draws them as screen-space texrects). Force lighting off
                     // so the scene's environment light doesn't modulate the sprite (white-scene -> white,
                     // dark-scene -> black). Restore the mode after.
@@ -965,6 +1010,11 @@ namespace RT64 {
                     state->rsp->drawIndexedTri(F5_FACE_SLOT, F5_FACE_SLOT + 3, F5_FACE_SLOT + 2);
                     state->rsp->drawIndexedTri(F5_FACE_SLOT, F5_FACE_SLOT + 1, F5_FACE_SLOT + 3);
                     gm = savedGM;
+                    if (!s_norestore) {
+                        state->rdp->setOtherMode(savedOMH, savedOML);
+                        state->rdp->primDepthStack[state->rdp->primDepthStackSize - 1] = savedPrimD;
+                        state->rdp->primColorStack[state->rdp->primColorStackSize - 1] = savedPrimC;
+                    }
                     s_task_faces += 2;
                 }
             }
@@ -1083,9 +1133,31 @@ namespace RT64 {
                     n, state->rdp->otherMode.textFilt(), state->rdp->otherMode.cycleType(),
                     state->rdp->otherMode.H, state->rdp->otherMode.L);
                 std::fflush(stderr); } }
-            state->rsp->setVertex(0x80000000u | (F5_VTX_SCRATCH + F5_FACE_SLOT * sizeof(RSP::Vertex)), n, F5_FACE_SLOT);
-            state->rsp->drawIndexedTri(F5_FACE_SLOT, F5_FACE_SLOT + 1, F5_FACE_SLOT + 2);
-            if (n == 4) state->rsp->drawIndexedTri(F5_FACE_SLOT, F5_FACE_SLOT + 2, F5_FACE_SLOT + 3);
+            // Effect meshes (explosion debris/exhaust, tex 0x543xxx) set zSource=PRIM (otherL 0xC810xxxx)
+            // so RT64 rasterizes the whole face at primDepth -- but the F5 stream never sends a primDepth
+            // in our HLE, so the face inherits a stale/default one: wrong sort, and on a looped scene the
+            // stale value is far -> the effects vanish ("particles stop on the 2nd run"). Set primDepth
+            // from the face center's own projected NDC depth, mirroring op_bd_sprite.
+            // ROGUESQ_F5_MESH_PRIMDEPTH=0 disables (A/B).
+            if ((state->rdp->otherMode.L & 0x04u) && !s_cull_skip) {
+                static const bool s_mpd = env_on("ROGUESQ_F5_MESH_PRIMDEPTH", true);
+                if (s_mpd) {
+                    const auto& mv = state->rsp->modelViewProjMatrix;
+                    float cx = 0, cy = 0, cz = 0;
+                    for (int k = 0; k < n; ++k) { cx += tmp[k].x; cy += tmp[k].y; cz += tmp[k].z; }
+                    cx /= n; cy /= n; cz /= n;
+                    const float clipZ = cx*(float)mv[0][2] + cy*(float)mv[1][2] + cz*(float)mv[2][2] + (float)mv[3][2];
+                    const float clipW = cx*(float)mv[0][3] + cy*(float)mv[1][3] + cz*(float)mv[2][3] + (float)mv[3][3];
+                    float ndcZ = (clipW > 1e-4f) ? (clipZ / clipW) : 1.0f;
+                    ndcZ = ndcZ < 0.0f ? 0.0f : (ndcZ > 1.0f ? 1.0f : ndcZ);
+                    state->rdp->setPrimDepth((uint16_t)(ndcZ * 32767.0f), 0);
+                }
+            }
+            if (!s_cull_skip) {
+                state->rsp->setVertex(0x80000000u | (F5_VTX_SCRATCH + F5_FACE_SLOT * sizeof(RSP::Vertex)), n, F5_FACE_SLOT);
+                state->rsp->drawIndexedTri(F5_FACE_SLOT, F5_FACE_SLOT + 1, F5_FACE_SLOT + 2);
+                if (n == 4) state->rsp->drawIndexedTri(F5_FACE_SLOT, F5_FACE_SLOT + 2, F5_FACE_SLOT + 3);
+            }
             ++s_task_faces;
         }
 
@@ -1156,9 +1228,6 @@ namespace RT64 {
             if (sc == 0) sc = 0xFFFF;
             if (tc == 0) tc = 0xFFFF;
             state->rsp->setTexture(tile, level, on, sc, tc);
-            { static int s_ss2 = -1; if (s_ss2 < 0) { const char* e = std::getenv("ROGUESQ_LOG_SKYSEQ"); s_ss2 = (e && e[0] == '1') ? 1 : 0; }
-              const LoadTile &rtt = state->rdp->tiles[tile];
-              if (s_ss2 && rtt.fmt == 0 && rtt.siz == 3) { std::fprintf(stderr, "[skyseq] GTEX tile=%u siz=%u on=%u\n", tile, rtt.siz, on); std::fflush(stderr); } }
         }
 
         // fillRect wrapper kept for the rdpstate module's declaration (op_02 coupling is gone).

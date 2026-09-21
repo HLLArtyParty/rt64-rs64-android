@@ -24,10 +24,6 @@
 #include "rhi/rt64_render_hooks.h"
 
 #include <atomic>
-// ROGUESQ_LOG_FRAMEGEN command-generation counters (defined here, incremented across
-// rt64_framebuffer_renderer.cpp and rt64_raster_shader_cache.cpp, emitted per submit above).
-std::atomic<unsigned> g_rs64_fg_draws{0}, g_rs64_fg_pipe{0}, g_rs64_fg_uber{0}, g_rs64_fg_variant{0}, g_rs64_fg_pso{0};
-
 // Per-frame RT64 workload accumulators feeding the F5 profiler HUD's RDP slots
 // (no real RDP on the PC path). Summed in State::flush(); read-and-cleared by
 // osDpGetCounters_recomp. tris->white(pipe), draws->magenta(cmd), texloads->green(tmem).
@@ -1475,15 +1471,6 @@ namespace RT64 {
                             depthFb->lastWriteType = Framebuffer::Type::Depth;
                         }
 
-                        // ROGUESQ_LOG_FULLSYNC=1: per-pair readback dims. A bogus colorFb/writeWidth
-                        // makes copyRenderTargetToNative dispatch an enormous shader that hangs the GPU
-                        // submit at execute() (the hangar black-screen hang). The last pair before a
-                        // [fullsync-exec] begin with no matching end is the culprit.
-                        { static int s_lf = -1; if (s_lf < 0) { const char* e = std::getenv("ROGUESQ_LOG_FULLSYNC"); s_lf = (e && *e && *e != '0') ? 1 : 0; }
-                          if (s_lf) { std::fprintf(stderr, "[fullsync-pair] pc=%u colorFb=%ux%u readH=%u colorImg.w=%u addr=0x%08X fmt=%u writeW=%u rows=%u..%u depthW=%u\n",
-                              pairCursor, colorFb->width, colorFb->height, colorFb->readHeight, colorImg.width, colorImg.address, (unsigned)colorImg.fmt,
-                              colorWriteWidth, colorRowStart, colorRowEnd, depthWriteWidth); std::fflush(stderr); } }
-
                         // Copy results from render targets back to RAM.
                         colorFb->copyRenderTargetToNative(ext.framebufferGraphicsWorker, colorTarget, colorWriteWidth, colorRowStart, colorRowEnd, colorImg.fmt, ditherRandomSeed++, ext.shaderLibrary);
 
@@ -1501,20 +1488,8 @@ namespace RT64 {
 
                 ext.framebufferGraphicsWorker->commandList->end();
                 framebufferRenderer->waitForUploaders();
-                { static int s_lf = -1; if (s_lf < 0) { const char* e = std::getenv("ROGUESQ_LOG_FULLSYNC"); s_lf = (e && *e && *e != '0') ? 1 : 0; }
-                  static unsigned s_ex = 0; unsigned ex = ++s_ex;
-                  if (s_lf) { std::fprintf(stderr, "[fullsync-exec #%u] begin pairs=[%u,%u)\n", ex, framebufferPairCursor, maxFramebufferPair); std::fflush(stderr); }
-                  // ROGUESQ_LOG_FRAMEGEN: per-submit command-generation profile, to A/B the hangar
-                  // (solid 3D + depth, hangs) vs AVAILABLE CRAFT (holograms, works). Each fullSync
-                  // submit is one execute()+wait(); depth pass-splits force many per-pair submits.
-                  static const bool s_fg = std::getenv("ROGUESQ_LOG_FRAMEGEN") != nullptr;
-                  if (s_fg) { std::fprintf(stderr, "[framegen submit#%u] pairs=[%u,%u) draws=%u pipeSwitch=%u uberMiss=%u variantReq=%u psoCreate=%u\n",
-                      ex, framebufferPairCursor, maxFramebufferPair,
-                      g_rs64_fg_draws.exchange(0), g_rs64_fg_pipe.exchange(0), g_rs64_fg_uber.exchange(0),
-                      g_rs64_fg_variant.exchange(0), g_rs64_fg_pso.exchange(0)); std::fflush(stderr); }
-                  ext.framebufferGraphicsWorker->execute();
-                  ext.framebufferGraphicsWorker->wait();
-                  if (s_lf) { std::fprintf(stderr, "[fullsync-exec #%u] end\n", ex); std::fflush(stderr); } }
+                ext.framebufferGraphicsWorker->execute();
+                ext.framebufferGraphicsWorker->wait();
 
                 pairCursor = framebufferPairCursor;
                 while (pairCursor < maxFramebufferPair) {
@@ -1560,17 +1535,11 @@ namespace RT64 {
                         // Width is not usable here (a width test blanked the display); alignment only. The
                         // width-1 garbage registrations are rejected upstream in setColorImage_filtered.
                         const bool colorFbPlausible = !s_wbStrict || (colorFb->addressStart & 0x3F) == 0;
-                        // ROGUESQ_LOG_WB=1: each distinct color write-back target once (address, width, rows).
-                        static const bool s_wbLog = [](){ const char* e = std::getenv("ROGUESQ_LOG_WB"); return e && e[0] && e[0] != '0'; }();
-                        if (s_wbLog) {
-                            static std::unordered_set<uint64_t> seen;
-                            const uint64_t key = ((uint64_t)colorFb->addressStart << 32) | ((uint64_t)colorWriteWidth << 16) | (uint64_t)std::min(colorRowEnd, colorFb->height);
-                            if (seen.insert(key).second) { fprintf(stderr, "[wb] color addr=0x%06X width=%u rows=%u..%u siz=%u\n", colorFb->addressStart, colorWriteWidth, colorRowStart, std::min(colorRowEnd, colorFb->height), colorFb->siz); fflush(stderr); }
-                        }
                         if (colorFbPlausible && colorFb->addressStart >= kFbMinAddr && colorFb->addressStart < kFbMaxAddr) {
                             colorFb->copyNativeToRAM(&(writeBackRDRAM ? writeBackRDRAM : RDRAM)[colorFb->addressStart], colorWriteWidth, colorRowStart, std::min(colorRowEnd, colorFb->height));
                         }
 
+                        static const bool s_wbLog = [](){ const char* e = std::getenv("ROGUESQ_RT64_WB_LOG"); return e && e[0] && e[0] != '0'; }();
                         if (s_wbLog && depthWriteWidth > 0) {
                             static std::unordered_set<uint64_t> seenD;
                             const uint64_t key = ((uint64_t)depthFb->addressStart << 32) | ((uint64_t)depthWriteWidth << 16) | (uint64_t)std::min(depthRowEnd, depthFb->height);

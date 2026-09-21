@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstdint>
+#include <chrono>
 
 //#define DUMP_DISPLAY_LISTS
 
@@ -24,6 +25,13 @@ namespace RT64 {
         F5RingEntry g_f5ring[96] = {};
         uint32_t g_f5ring_pos = 0;
         int g_f5ring_on = -1;
+    }
+    // ROGUESQ_LOG_WALK_PROFILE: per-opcode timing inside the F5 walk; dumps command count and
+    // the hottest opcodes whenever one walk exceeds ~20ms, to attribute the hitch spikes.
+    static bool rt64_walk_profile_enabled() {
+        static int on = -1;
+        if (on < 0) { const char *e = std::getenv("ROGUESQ_LOG_WALK_PROFILE"); on = (e && e[0] && e[0] != '0') ? 1 : 0; }
+        return on == 1;
     }
     bool rt64_f5_desync_enabled() {
         if (g_f5ring_on < 0) { const char *e = std::getenv("ROGUESQ_DESYNC_TRACE"); g_f5ring_on = (e && e[0] && e[0] != '0') ? 1 : 0; }
@@ -210,11 +218,17 @@ namespace RT64 {
         uint8_t opCode;
         GBIFunction func;
         const bool desyncTrace = rt64_f5_desync_enabled();
+        const bool walkProf = rt64_walk_profile_enabled();
+        uint64_t prof_us[256] = {}; uint32_t prof_n[256] = {}; uint64_t prof_cmds = 0;
+        const auto prof_t0 = walkProf ? std::chrono::high_resolution_clock::now()
+                                      : std::chrono::high_resolution_clock::time_point{};
         while (dl != nullptr) {
             opCode = (dl->w0 >> 24);
 
             if (desyncTrace) rt64_f5_desync_record(opCode, dl->w0, dl->w1, reinterpret_cast<const void *>(reinterpret_cast<const uint8_t *>(dl) - state->RDRAM));   // RDRAM offset, not host pointer
 
+            const auto cmd_t0 = walkProf ? std::chrono::high_resolution_clock::now()
+                                         : std::chrono::high_resolution_clock::time_point{};
             if ((extendedOpCode != 0) && (opCode == extendedOpCode)) {
                 extendedFunction(state, &dl);
             }
@@ -232,9 +246,31 @@ namespace RT64 {
                     RT64_LOG_PRINTF("DL Parser ran into an unknown opCode (GBI %u): %u / 0x%X", uint32_t(hleGBI->ucode), opCode, opCode);
                 }
             }
+            if (walkProf) {
+                prof_us[opCode] += (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::high_resolution_clock::now() - cmd_t0).count();
+                prof_n[opCode]++; prof_cmds++;
+            }
 
             if (dl != nullptr) {
                 dl++;
+            }
+        }
+
+        if (walkProf) {
+            const uint64_t total_us = (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::high_resolution_clock::now() - prof_t0).count();
+            if (total_us > 20000) {
+                char buf[512]; int off = snprintf(buf, sizeof buf,
+                    "[walkprof] %.1fms cmds=%llu top:", total_us / 1000.0, (unsigned long long)prof_cmds);
+                for (int k = 0; k < 4; ++k) {
+                    int best = -1; uint64_t bestv = 0;
+                    for (int o = 0; o < 256; ++o) if (prof_us[o] > bestv) { bestv = prof_us[o]; best = o; }
+                    if (best < 0 || bestv == 0) break;
+                    off += snprintf(buf + off, sizeof buf - off, " 0x%02X=%.1fms/n%u", best, bestv / 1000.0, prof_n[best]);
+                    prof_us[best] = 0;
+                }
+                fprintf(stderr, "%s\n", buf); fflush(stderr);
             }
         }
 

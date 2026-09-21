@@ -1305,12 +1305,6 @@ namespace RT64 {
         const float w1 = posTransformed[globalIndices[1]].w;
         const float w2 = posTransformed[globalIndices[2]].w;
         const bool nearCrossing = (w0 <= 0.0f) || (w1 <= 0.0f) || (w2 <= 0.0f);
-        // ROGUESQ_LOG_ZW=1: sample clip-space z and w of drawn tris (fog/near-plane calibration).
-        { static int s_lzw = -1; if (s_lzw < 0) { const char* e = std::getenv("ROGUESQ_LOG_ZW"); s_lzw = (e && e[0] == '1') ? 1 : 0; }
-          static uint32_t s_n = 0;
-          if (s_lzw && (++s_n % 500) == 0 && s_n < 500 * 400) {
-              const auto &p = posTransformed[globalIndices[0]];
-              fprintf(stderr, "[zw] z=%.1f w=%.1f z/w=%.4f fog=%d mul=%.0f off=%.0f\n", (float)p.z, (float)p.w, ((float)p.w != 0.0f) ? ((float)p.z / (float)p.w) : 0.0f, (int)(geometryMode & G_FOG), fog.mul, fog.offset); fflush(stderr); } }
 
         bool visibleTri = true;
         const bool usesCulling = !s_nocull && !doubleSided && (geometryMode & cullTestMask);

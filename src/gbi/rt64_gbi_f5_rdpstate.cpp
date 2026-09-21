@@ -803,6 +803,52 @@ namespace RT64 {
                     state->rdp->setOtherMode(0x00584040u, 0x0C084000u);
                 }
             }
+            // ROGUESQ_TEXRECT_PROBE=1: log each medal/insignia texrect (fmt4 src 0x62xxxx) that
+            // actually REACHES RT64's draw, with the real colorImage target. Distinguishes
+            // "interpreter never reaches it" (no log) from "drawn to a non-menu buffer" (log w/ odd cimg).
+            {
+                static const bool s_trp = []{ const char* v = std::getenv("ROGUESQ_TEXRECT_PROBE"); return v && *v && v[0] != '0'; }();
+                if (s_trp) {
+                    const uint32_t tsrc = state->rdp->texture.address & 0x00FFFFFFu;
+                    if (tsrc >= 0x620000u && tsrc < 0x628000u) {
+                        static int s_tn = 0;
+                        // Per-frame medal-draw count: log once per displayListCounter so a run shows
+                        // whether the medals draw EVERY frame (gap==1) or intermittently (gap>>1).
+                        static uint32_t s_lastDl = 0xFFFFFFFFu; static int s_perFrame = 0;
+                        if (state->displayListCounter != s_lastDl) {
+                            if (s_lastDl != 0xFFFFFFFFu && s_tn < 200)
+                                std::fprintf(stderr, "[texrect-frame] dl#%u medalRects=%d cimg=0x%08X\n", s_lastDl, s_perFrame, state->rdp->colorImage.address);
+                            s_lastDl = state->displayListCounter; s_perFrame = 0;
+                        }
+                        ++s_perFrame;
+                        if (++s_tn <= 12) {
+                            const int32_t ulx = (*dl)[0].p1(12,12)>>2, uly = (*dl)[0].p1(0,12)>>2;
+                            const int32_t lrx = (*dl)[0].p0(12,12)>>2, lry = (*dl)[0].p0(0,12)>>2;
+                            std::fprintf(stderr, "[texrect-probe] #%d dl#%u DREW medal tex=0x%06X -> cimg=0x%08X w=%u px=(%d,%d)-(%d,%d)\n",
+                                s_tn, state->displayListCounter, tsrc, state->rdp->colorImage.address, state->rdp->colorImage.width, ulx, uly, lrx, lry);
+                            std::fflush(stderr);
+                        }
+                    }
+                }
+            }
+            // ROGUESQ_MEDAL_FORCE=1: decisive visibility test — draw each medal/insignia texrect
+            // (fmt4 0x62xxxx) as a bright OPAQUE green fillRect at its own coords. If green blocks
+            // appear where the medals belong, the geometry/target/present is fine and the medal
+            // texture/blend is the bug. If nothing shows, the layer is overwritten / not presented.
+            {
+                static const bool s_mforce = []{ const char* v = std::getenv("ROGUESQ_MEDAL_FORCE"); return v && *v && v[0] != '0'; }();
+                if (s_mforce) {
+                    const uint32_t tsrc = state->rdp->texture.address & 0x00FFFFFFu;
+                    if (tsrc >= 0x620000u && tsrc < 0x628000u) {
+                        state->rdp->setFillColor(0x07C107C1u);  // RGBA5551 bright green, opaque
+                        int32_t ulx = (*dl)[0].p1(12,12), uly = (*dl)[0].p1(0,12);
+                        int32_t lrx = (*dl)[0].p0(12,12), lry = (*dl)[0].p0(0,12);
+                        state->rdp->fillRect(ulx, uly, lrx, lry);
+                        (*dl)++;  // consume the LLE texrect follow-up word
+                        return;
+                    }
+                }
+            }
             GBI_RDP::texrectLLE(state, dl);
         }
 
@@ -899,9 +945,6 @@ namespace RT64 {
             if (s_split) state->flush();
             state->rdp->loadTile(tile, uls, ult, lrs, lrt);
             if (s_split) state->updateDrawStatusAttribute(DrawAttribute::Texture);
-            { static int s_ss = -1; if (s_ss < 0) { const char* e = std::getenv("ROGUESQ_LOG_SKYSEQ"); s_ss = (e && e[0] == '1') ? 1 : 0; }
-              uint32_t ssrc = state->rdp->texture.address & 0x00FFFFFFu;
-              if (s_ss && ssrc >= 0x531000u && ssrc <= 0x542000u) { std::fprintf(stderr, "[skyseq] LOADTILE src=0x%06X siz=%u\n", ssrc, state->rdp->texture.siz); std::fflush(stderr); } }
         }
 
         void loadBlock_guarded(State *state, DisplayList **dl) {
@@ -1025,9 +1068,6 @@ namespace RT64 {
                     std::fflush(stderr);
                 }
             }
-            { static int s_ss = -1; if (s_ss < 0) { const char* e = std::getenv("ROGUESQ_LOG_SKYSEQ"); s_ss = (e && e[0] == '1') ? 1 : 0; }
-              const uint32_t ssrc = state->rdp->texture.address & 0x00FFFFFFu;
-              if (s_ss && ssrc >= 0x531000u && ssrc <= 0x542000u) { std::fprintf(stderr, "[skyseq] LOAD src=0x%06X siz=%u\n", ssrc, state->rdp->texture.siz); std::fflush(stderr); } }
             // ROGUESQ_DUMP_TEX: after a flipbook loadBlock, FORCE the (normally
             // deferred) load to execute and dump TMEM[0..3], so we can compare the
             // loaded TMEM to the coherent source bytes. If TMEM matches source -> the

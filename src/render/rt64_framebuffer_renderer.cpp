@@ -9,9 +9,6 @@
 #include <cstdlib>
 #include <cstring>
 
-// ROGUESQ_LOG_FRAMEGEN counters (defined in rt64_state.cpp).
-extern std::atomic<unsigned> g_rs64_fg_draws, g_rs64_fg_pipe, g_rs64_fg_uber, g_rs64_fg_variant, g_rs64_fg_pso;
-
 #include "../include/rt64_extended_gbi.h"
 
 #include "common/rt64_elapsed_timer.h"
@@ -276,25 +273,6 @@ namespace RT64 {
                 bool shiftedByHalf = false;
                 textureCache->useTexture(callTile.tmemHashOrID, submissionFrame, textureIndex, gpuTile.tcScale, gpuTile.textureDimensions, textureReplaced, hasMipmaps, shiftedByHalf);
 
-                // DIAG (ROGUESQ_LOG_SKYTEX=1): is the RGBA32 skybox texture actually bound at draw time,
-                // or is it a texture-cache miss -> blank slot (textureIndex 0)? Confirms/refutes the
-                // white-sky bind theory. RGBA32 (fmt=0 siz=3) is unique to the sky in this game.
-                {
-                    static int s_logsky = -1;
-                    if (s_logsky < 0) { const char* e = std::getenv("ROGUESQ_LOG_SKYTEX"); s_logsky = (e && e[0] == '1') ? 1 : 0; }
-                    if (s_logsky && callTile.loadTile.siz == 3 && callTile.loadTile.fmt == 0) {
-                        static int nSky = 0, nMiss = 0;
-                        ++nSky;
-                        if (textureIndex == 0) ++nMiss;
-                        if (nSky <= 40 || (nSky % 200) == 0) {
-                            fprintf(stderr, "[skytex] rgba32 hash=%016llx idx=%u %s (n=%d miss=%d)\n",
-                                (unsigned long long)callTile.tmemHashOrID, textureIndex,
-                                (textureIndex == 0) ? "MISS/BLANK" : "bound", nSky, nMiss);
-                            fflush(stderr);
-                        }
-                    }
-                }
-
                 // Describe the GPU tile for a regular texture.
                 gpuTile.ulScale.x = gpuTile.tcScale.x;
                 gpuTile.ulScale.y = gpuTile.tcScale.y;
@@ -553,7 +531,6 @@ namespace RT64 {
         };
 
         auto drawCallTriangles = [&](const InstanceDrawCall &drawCall) {
-            ++g_rs64_fg_draws;
             if (drawCall.type == InstanceDrawCall::Type::IndexedTriangles) {
                 worker->commandList->drawIndexedInstanced(drawCall.triangles.faceCount * 3, 1, drawCall.triangles.indexStart, 0, 0);
             }
@@ -723,7 +700,6 @@ namespace RT64 {
                 }
 
                 if (previousPipeline != triangles.pipeline) {
-                    ++g_rs64_fg_pipe;
                     worker->commandList->setPipeline(triangles.pipeline);
                     previousPipeline = triangles.pipeline;
                 }
@@ -1797,7 +1773,6 @@ namespace RT64 {
                             triangles.pipeline = gpuShader->pipeline.get();
                         }
                         else {
-                            ++g_rs64_fg_uber;
                             const bool copyMode = (call.shaderDesc.otherMode.cycleType() == G_CYC_COPY);
                             triangles.pipeline = rasterShaderUber->getPipeline(
                                 !copyMode && call.shaderDesc.otherMode.zCmp() && (call.shaderDesc.otherMode.zMode() != ZMODE_DEC),
