@@ -116,6 +116,27 @@ namespace RT64 {
             static bool s = env_on("ROGUESQ_F5_TERRAIN_ID", false);
             return s;
         }
+        // ROGUESQ_F5_PROJ_LOG=1: log the projection matrix depth terms + derived near/far, and tag each
+        // viewport (STREAM from 03 80, or SYNTH from scissor) with its z scale/translate. Diagnoses
+        // whether the far plane is squeezed by RT64's depth mapping (the late-level horizontal far cut).
+        static bool f5_proj_log() { static bool s = env_on("ROGUESQ_F5_PROJ_LOG", false); return s; }
+        // ROGUESQ_F5_ALT_PROBE=1: log modelview translations and loaded-vertex ranges to find what
+        // saturates/wraps as the player climbs (ship faces cull progressively with altitude).
+        static bool f5_alt_probe() { static bool s = env_on("ROGUESQ_F5_ALT_PROBE", false); return s; }
+        // ROGUESQ_F5_FAR_CLAMP=1 (default on): RS64's projection asymptotes ndc.z to ~1.0062 (>1), so
+        // distant geometry (view.z beyond ~9700) is discarded by RT64's z>1 clip where the N64 RDP drew
+        // it clamped-and-fogged -> a horizontal far cut in high-ceiling levels (Calamari/Sullust/etc).
+        // Fix: when a projection's depth asymptote (M[10]) exceeds 1, affine-remap ndc.z to pull the
+        // asymptote just under 1 while pinning the near plane (ndc.z=-1), so nothing crosses the clip.
+        // Default ON. The projection asymptotes ndc.z to ~1.006, so the tallest structures' tops sit
+        // past the far plane and get GPU-clipped (N64 clamped them instead). The remap pulls the
+        // asymptote under 1 so they draw. Its target T must sit well BELOW the skybox dome's pinned
+        // depth (0.99999, rt64_state.cpp) or the tops z-fight the dome into shards.
+        // Default OFF: superseded by the N64-style far-plane depth CLAMP in RSP::setVertex (rt64_rsp.cpp).
+        // The affine remap preserved depth ORDER past the far plane, so the horizon haze overlay (farther)
+        // always lost the depth test to beyond-far water instead of tying with it as on hardware -> the
+        // haze was cut along the water's far row (the horizon "ring"). Kept env-gated for A/B only.
+        static bool f5_far_clamp() { static bool s = env_on("ROGUESQ_F5_FAR_CLAMP", false); return s; }
         static constexpr uint32_t F5_NODE_MAP_SLOTS = 256;
         static uint32_t s_node_map[2][F5_NODE_MAP_SLOTS] = {};   // [buffer][slot] = stamped id (0 = leave AUTO)
         // A node only gets an interpolation id if it existed last frame (stable). Transient nodes
@@ -235,6 +256,10 @@ namespace RT64 {
         static GBIFunction s_inner[UCODE_MAP_SIZE];
         static constexpr int F5_MAX_DEPTH = 64;
         static uint32_t s_task_faces = 0;
+        // True once the game sent G_SETPRIMDEPTH (0xEE) for the current zSource=PRIM state (the sky
+        // pins itself to 0x7FBE this way). Cleared when a 0xB9 turns zSource off. Effect meshes set
+        // zSource=PRIM without an 0xEE and rely on the synthesized per-face depth instead.
+        static bool s_prim_depth_from_game = false;
         static uint32_t s_task_budget_trip = 0;
         static uint32_t s_task_tiles = 0;
         static uint32_t s_task_maxchain = 0;
@@ -243,6 +268,7 @@ namespace RT64 {
         // segmented mask allows 16 MB and the host buffer is 512 MB).
         static constexpr uint32_t F5_VTX_SCRATCH = 0x00A00000u;   // 256 x 16 bytes
         static constexpr uint32_t F5_VP_SCRATCH  = 0x00A01000u;
+        static constexpr uint32_t F5_PROJ_SCRATCH = 0x00A01100u;  // 16 host floats: remapped projection
         static constexpr uint32_t F5_FACE_SLOT   = 200;           // temp slots for per-face UVs
 
         struct F5Vp { int16_t vscale[4]; int16_t vtrans[4]; };   // RT64 reads halfword-swapped words
@@ -457,7 +483,10 @@ namespace RT64 {
             const int32_t px[4] = { x, x + sz, x, x + sz }, pz[4] = { z, z, z + sz, z + sz };
             const int16_t us[4] = { 0, s, 0, s }, vt[4] = { s, s, 0, 0 };
             for (int k = 0; k < 4; ++k) {
-                tmp[k].x = (int16_t)px[k]; tmp[k].y = (int16_t)(y + h[k]); tmp[k].z = (int16_t)pz[k]; tmp[k].flag = 0;
+                // y is h<<4 (up to +-524k); a bare int16 cast wraps for source heights > 2047 (tall
+                // high-ceiling terrain) and snaps the vertex to the bottom -> terrain holes. Saturate.
+                { const int32_t yy = y + h[k]; tmp[k].y = (int16_t)(yy > 32767 ? 32767 : (yy < -32768 ? -32768 : yy)); }
+                tmp[k].x = (int16_t)px[k]; tmp[k].z = (int16_t)pz[k]; tmp[k].flag = 0;
                 tmp[k].s = us[k]; tmp[k].t = vt[k];
                 tmp[k].color.r = (uint8_t)(col[k] >> 24); tmp[k].color.g = (uint8_t)(col[k] >> 16);
                 tmp[k].color.b = (uint8_t)(col[k] >> 8);  tmp[k].color.a = (uint8_t)col[k];
@@ -596,7 +625,7 @@ namespace RT64 {
                 const float h = (H[y0*5+x0]*(1-tx) + H[y0*5+x0+1]*tx) * (1-ty)
                               + (H[(y0+1)*5+x0]*(1-tx) + H[(y0+1)*5+x0+1]*tx) * ty;
                 v.x = (int16_t)(x + (int32_t)(fx * step5));
-                v.y = (int16_t)(y + (int32_t)(h * hcoeff));
+                { const int32_t yy = y + (int32_t)(h * hcoeff); v.y = (int16_t)(yy > 32767 ? 32767 : (yy < -32768 ? -32768 : yy)); }   // saturate, see f5_tile_quad
                 v.z = (int16_t)(z + (int32_t)(fy * step5));
                 v.flag = 0; v.s = (int16_t)(uvcell * fx); v.t = (int16_t)(uvcell * (4.0f - fy));
                 // Colors: real samples sit every (1<<shift) in the N*N grid; the parser overlay averages
@@ -657,6 +686,12 @@ namespace RT64 {
         // exceed RT64's int16 setFog range (a ramp only ~0.001 of depth wide).
         static double s_f5_fog_m = 0.0, s_f5_fog_o = 0.0;
         static void f5_apply_fog(State* state) {
+            static int s_nofog = -1;
+            if (s_nofog < 0) { const char* e = std::getenv("ROGUESQ_F5_NO_FOG"); s_nofog = (e && e[0] && e[0] != '0') ? 1 : 0; }
+            if (s_nofog) { state->rsp->fog.mul = 0.0f; state->rsp->fog.offset = 0.0f; state->rsp->fogChanged = true; return; }
+            if (f5_proj_log()) { static int n = 0; if ((n++ % 120) == 0)
+                std::fprintf(stderr, "[f5-fog] M=%.6f O=%.6f -> mul=%.3f offset=%.3f\n",
+                    s_f5_fog_m, s_f5_fog_o, 255.0 * s_f5_fog_m, 255.0 * s_f5_fog_o); std::fflush(stderr); }
             state->rsp->fog.mul = (float)(255.0 * s_f5_fog_m);
             state->rsp->fog.offset = (float)(255.0 * s_f5_fog_o);
             state->rsp->fogChanged = true;
@@ -706,6 +741,10 @@ namespace RT64 {
             vp->vtrans[1] = vt[0]; vp->vtrans[0] = vt[1]; vp->vtrans[3] = vt[2]; vp->vtrans[2] = vt[3];
             state->rsp->setViewport(0x80000000u | F5_VP_SCRATCH);
             f5_apply_clip_ratio(state);
+            if (f5_proj_log()) { static int n = 0; if ((n++ % 120) == 0)
+                std::fprintf(stderr, "[f5-vp] STREAM vscale[%d %d %d %d] vtrans[%d %d %d %d]\n",
+                    vp->vscale[0], vp->vscale[1], vp->vscale[2], vp->vscale[3],
+                    vp->vtrans[0], vp->vtrans[1], vp->vtrans[2], vp->vtrans[3]); std::fflush(stderr); }
             s_vp_key = 0xFFFFFFFFu;   // stream-provided: no synthesis until the next task
         }
 
@@ -725,6 +764,10 @@ namespace RT64 {
             vp->vtrans[1] = (int16_t)(xs + r.ulx / 2); vp->vtrans[0] = (int16_t)(ys + r.uly / 2); vp->vtrans[3] = 511; vp->vtrans[2] = 0;
             state->rsp->setViewport(0x80000000u | F5_VP_SCRATCH);
             f5_apply_clip_ratio(state);
+            if (f5_proj_log()) { static int n = 0; if ((n++ % 120) == 0)
+                std::fprintf(stderr, "[f5-vp] SYNTH w=%d h=%d vscale[%d %d %d %d] vtrans[%d %d %d %d]\n", w, h,
+                    vp->vscale[0], vp->vscale[1], vp->vscale[2], vp->vscale[3],
+                    vp->vtrans[0], vp->vtrans[1], vp->vtrans[2], vp->vtrans[3]); std::fflush(stderr); }
         }
 
         // 0x01: matrix load. byte1 0x03 = projection, 0x02 = modelview; a matrix whose bottom-right
@@ -859,7 +902,57 @@ namespace RT64 {
                   }
             }
 
-            state->rsp->matrix(w1, proj ? 0x03 : 0x02);   // F3D constants: PROJECTION=1, LOAD=2
+            bool submittedRemap = false;
+            if (proj && f5_far_clamp()) {
+                float M[16];
+                for (int i = 0; i < 16; ++i) M[i] = (float)rd_be_s16(ram, w1 + 2 * i) + (float)rd_be_u16(ram, w1 + 32 + 2 * i) / 65536.0f;
+                const float A = M[10];   // ndc.z asymptote (row-vector: clip.z=col2, clip.w=col3 with M[11]=1, M[15]=0)
+                if (A > 1.0001f) {
+                    // Affine remap ndc.z' = a*ndc.z + b: pin the near plane (ndc.z=-1 -> -1) and pull the
+                    // asymptote A down to T (<1). clip.z' = a*clip.z + b*clip.w => column 2 := a*col2 + b*col3.
+                    const float T = 0.99500f;   // keep clear of the dome pinned at 0.99999
+                    const float a = (T + 1.0f) / (A + 1.0f), b = a - 1.0f;
+                    M[2]  = a * M[2]  + b * M[3];
+                    M[6]  = a * M[6]  + b * M[7];
+                    M[10] = a * M[10] + b * M[11];
+                    M[14] = a * M[14] + b * M[15];
+                    float* dst = reinterpret_cast<float*>(state->fromRDRAM(F5_PROJ_SCRATCH));
+                    for (int i = 0; i < 16; ++i) dst[i] = M[i];
+                    state->rsp->matrixFloat(0x80000000u | F5_PROJ_SCRATCH, 0x03);
+                    submittedRemap = true;
+                    if (f5_proj_log()) { static int n = 0; if ((n++ % 120) == 0)
+                        std::fprintf(stderr, "[f5-remap] FIRED A=%.4f a=%.5f b=%.5f newAsym=%.5f\n",
+                            A, a, b, M[10]); std::fflush(stderr); }
+                }
+            }
+            if (!submittedRemap)
+                state->rsp->matrix(w1, proj ? 0x03 : 0x02);   // F3D constants: PROJECTION=1, LOAD=2
+
+            if (!proj && f5_alt_probe()) {
+                const float tx = (float)rd_be_s16(ram, w1 + 2 * 12) + (float)rd_be_u16(ram, w1 + 32 + 2 * 12) / 65536.0f;
+                const float ty = (float)rd_be_s16(ram, w1 + 2 * 13) + (float)rd_be_u16(ram, w1 + 32 + 2 * 13) / 65536.0f;
+                const float tz = (float)rd_be_s16(ram, w1 + 2 * 14) + (float)rd_be_u16(ram, w1 + 32 + 2 * 14) / 65536.0f;
+                const int16_t iy = rd_be_s16(ram, w1 + 2 * 13);
+                static int n = 0; ++n;
+                // Always log large/near-rail translations; otherwise sample every 90th load.
+                if (iy > 8000 || iy < -8000 || (n % 90) == 0) {
+                    std::fprintf(stderr, "[alt-mv] addr=%06X t=(%.1f %.1f %.1f) iy=%d m11=%.4f m22=%.4f\n",
+                        w1 & 0x00FFFFFFu, tx, ty, tz, (int)iy,
+                        (float)rd_be_s16(ram, w1 + 2 * 5) + (float)rd_be_u16(ram, w1 + 32 + 2 * 5) / 65536.0f,
+                        (float)rd_be_s16(ram, w1 + 2 * 10) + (float)rd_be_u16(ram, w1 + 32 + 2 * 10) / 65536.0f);
+                    std::fflush(stderr);
+                }
+            }
+            if (proj && f5_proj_log()) { static int n = 0; if ((n++ % 120) == 0) {
+                float M[16];
+                for (int i = 0; i < 16; ++i) M[i] = (float)rd_be_s16(ram, w1 + 2 * i) + (float)rd_be_u16(ram, w1 + 32 + 2 * i) / 65536.0f;
+                // Row-vector N64 layout: clip.z from M[8..10]/M[14], clip.w from M[11]/M[15].
+                const float A = M[10], C = M[14], wz = M[11], ww = M[15];  // ndc.z = (z*A + w*C)/(z*wz + w*ww)
+                // near: ndc.z=-1, far: ndc.z=+1 -> solve for view-space z (w=1).
+                const float nearZ = (wz + ww != 0.0f) ? (C + ww) / -(A + wz) : 0.0f;   // ndc=-1
+                const float farZ  = (ww - wz != 0.0f) ? (C - ww) / -(A - wz) : 0.0f;   // ndc=+1
+                std::fprintf(stderr, "[f5-proj] z-row[%.4f %.4f %.4f %.4f] w-row[%.4f %.4f %.4f %.4f] near~%.1f far~%.1f\n",
+                    M[8], M[9], M[10], M[11], M[12], M[13], M[14], M[15], nearZ, farZ); std::fflush(stderr); } }
 
             // ROGUESQ_LOG_FACE_UV: compose the full fixed-point matrix (int part + frac/65536)
             // and print its top-left 3x3 + translation. A ~90-deg rotation in the upper-left
@@ -903,11 +996,27 @@ namespace RT64 {
             const uint32_t cbuf = s_last_op02_colorbuf;
             const bool haveColors = cbuf >= 0x80000000u && ((cbuf & 0x00FFFFFFu) + n * 4) <= RDRAMSize;
             RSP::Vertex* out = reinterpret_cast<RSP::Vertex*>(state->fromRDRAM(F5_VTX_SCRATCH));
+            int32_t pmnX = 32767, pmxX = -32768, pmnY = 32767, pmxY = -32768, pmnZ = 32767, pmxZ = -32768;
             for (uint32_t i = 0; i < n; ++i) {
                 const uint32_t va = w1 + i * 8;
                 out[i].x = (int16_t)rd_be_s16(ram, va);
                 out[i].y = (int16_t)rd_be_s16(ram, va + 2);
                 out[i].z = (int16_t)rd_be_s16(ram, va + 4);
+                if (f5_alt_probe()) {
+                    if (out[i].x < pmnX) pmnX = out[i].x; if (out[i].x > pmxX) pmxX = out[i].x;
+                    if (out[i].y < pmnY) pmnY = out[i].y; if (out[i].y > pmxY) pmxY = out[i].y;
+                    if (out[i].z < pmnZ) pmnZ = out[i].z; if (out[i].z > pmxZ) pmxZ = out[i].z;
+                    if (i + 1 == n) {
+                        static int pn = 0; ++pn;
+                        const bool rail = pmnX <= -32000 || pmxX >= 32000 || pmnY <= -32000 || pmxY >= 32000 || pmnZ <= -32000 || pmxZ >= 32000;
+                        if (rail || (pn % 90) == 0) {
+                            const uint32_t gmCull = state->rsp->geometryModeStack[state->rsp->geometryModeStackSize - 1] & 0x3000u;
+                            std::fprintf(stderr, "[alt-vtx] src=%06X n=%u x[%d..%d] y[%d..%d] z[%d..%d] cull=%04X%s\n",
+                                w1 & 0x00FFFFFFu, n, pmnX, pmxX, pmnY, pmxY, pmnZ, pmxZ, gmCull, rail ? " RAIL" : "");
+                            std::fflush(stderr);
+                        }
+                    }
+                }
                 out[i].flag = 0;
                 out[i].s = 0;
                 out[i].t = 0;
@@ -993,13 +1102,6 @@ namespace RT64 {
                     // ROGUESQ_F5_SPRITE_NODEPTH=1 restores the no-depth-test band-aid for A/B.
                     static const bool s_nodepth = env_on("ROGUESQ_F5_SPRITE_NODEPTH", false);
                     state->rdp->setOtherMode(state->rdp->otherMode.H, s_nodepth ? 0x00504A44u : 0x00504A54u);
-                    {
-                        const float clipZ = c.x*(float)mv[0][2] + c.y*(float)mv[1][2] + c.z*(float)mv[2][2] + (float)mv[3][2];
-                        const float clipW = c.x*(float)mv[0][3] + c.y*(float)mv[1][3] + c.z*(float)mv[2][3] + (float)mv[3][3];
-                        float ndcZ = (clipW > 1e-4f) ? (clipZ / clipW) : 1.0f;
-                        ndcZ = ndcZ < 0.0f ? 0.0f : (ndcZ > 1.0f ? 1.0f : ndcZ);
-                        state->rdp->setPrimDepth((uint16_t)(ndcZ * 32767.0f), 0);
-                    }
                     // Billboards are UNLIT (hw draws them as screen-space texrects). Force lighting off
                     // so the scene's environment light doesn't modulate the sprite (white-scene -> white,
                     // dark-scene -> black). Restore the mode after.
@@ -1007,6 +1109,22 @@ namespace RT64 {
                     const uint32_t savedGM = gm;
                     gm &= ~(uint32_t)G_LIGHTING;
                     state->rsp->setVertex(0x80000000u | (F5_VTX_SCRATCH + F5_FACE_SLOT * sizeof(RSP::Vertex)), 4, F5_FACE_SLOT);
+                    // primDepth must equal the depth a normally-projected vertex gets here. RasterVS never
+                    // applies an MVP: it rebuilds clip space from the CPU's posScreen (z_clip = posScreen.z*w),
+                    // and for zSource=PRIM it uses z_clip = primDepth*w. So take the depth from the verts we
+                    // just transformed. Re-multiplying the center through rsp->modelViewProjMatrix (the old
+                    // code) reads a STALE matrix -- it is only refreshed lazily inside setVertex -- and stamped
+                    // sprites ~2x too far (RenderDoc: w=8023 quad at ndc.z 0.9996 vs true 0.9979), so lasers
+                    // and particles failed the depth test against water/structures ("trails cut through").
+                    {
+                        const int wc = state->ext.workloadQueue->writeCursor;
+                        const auto &ps = state->ext.workloadQueue->workloads[wc].drawData.posScreen;
+                        float z = 0.0f;
+                        for (int k = 0; k < 4; ++k) z += (float)ps[state->rsp->indices[F5_FACE_SLOT + k]][2];
+                        z *= 0.25f;
+                        z = z < 0.0f ? 0.0f : (z > 1.0f ? 1.0f : z);
+                        state->rdp->setPrimDepth((uint16_t)(z * 32767.0f), 0);
+                    }
                     state->rsp->drawIndexedTri(F5_FACE_SLOT, F5_FACE_SLOT + 3, F5_FACE_SLOT + 2);
                     state->rsp->drawIndexedTri(F5_FACE_SLOT, F5_FACE_SLOT + 1, F5_FACE_SLOT + 3);
                     gm = savedGM;
@@ -1134,27 +1252,25 @@ namespace RT64 {
                     state->rdp->otherMode.H, state->rdp->otherMode.L);
                 std::fflush(stderr); } }
             // Effect meshes (explosion debris/exhaust, tex 0x543xxx) set zSource=PRIM (otherL 0xC810xxxx)
-            // so RT64 rasterizes the whole face at primDepth -- but the F5 stream never sends a primDepth
-            // in our HLE, so the face inherits a stale/default one: wrong sort, and on a looped scene the
-            // stale value is far -> the effects vanish ("particles stop on the 2nd run"). Set primDepth
-            // from the face center's own projected NDC depth, mirroring op_bd_sprite.
-            // ROGUESQ_F5_MESH_PRIMDEPTH=0 disables (A/B).
-            if ((state->rdp->otherMode.L & 0x04u) && !s_cull_skip) {
-                static const bool s_mpd = env_on("ROGUESQ_F5_MESH_PRIMDEPTH", true);
-                if (s_mpd) {
-                    const auto& mv = state->rsp->modelViewProjMatrix;
-                    float cx = 0, cy = 0, cz = 0;
-                    for (int k = 0; k < n; ++k) { cx += tmp[k].x; cy += tmp[k].y; cz += tmp[k].z; }
-                    cx /= n; cy /= n; cz /= n;
-                    const float clipZ = cx*(float)mv[0][2] + cy*(float)mv[1][2] + cz*(float)mv[2][2] + (float)mv[3][2];
-                    const float clipW = cx*(float)mv[0][3] + cy*(float)mv[1][3] + cz*(float)mv[2][3] + (float)mv[3][3];
-                    float ndcZ = (clipW > 1e-4f) ? (clipZ / clipW) : 1.0f;
-                    ndcZ = ndcZ < 0.0f ? 0.0f : (ndcZ > 1.0f ? 1.0f : ndcZ);
-                    state->rdp->setPrimDepth((uint16_t)(ndcZ * 32767.0f), 0);
-                }
-            }
+            // without an 0xEE, so RT64 would rasterize them at a stale primDepth. Synthesize one from the
+            // face's own projected depth. Skipped when the game sent its own 0xEE (the sky pins itself to
+            // 0x7FBE; overriding that drew the horizon haze over far structures). ROGUESQ_F5_MESH_PRIMDEPTH=0 A/B.
             if (!s_cull_skip) {
                 state->rsp->setVertex(0x80000000u | (F5_VTX_SCRATCH + F5_FACE_SLOT * sizeof(RSP::Vertex)), n, F5_FACE_SLOT);
+                if ((state->rdp->otherMode.L & 0x04u) && !s_prim_depth_from_game) {
+                    static const bool s_mpd = env_on("ROGUESQ_F5_MESH_PRIMDEPTH", true);
+                    if (s_mpd) {
+                        // Depth from the verts just transformed (posScreen.z == the GPU depth), not a
+                        // re-multiply through rsp->modelViewProjMatrix, which is stale here -- see op_bd.
+                        const int wc = state->ext.workloadQueue->writeCursor;
+                        const auto &ps = state->ext.workloadQueue->workloads[wc].drawData.posScreen;
+                        float z = 0.0f;
+                        for (int k = 0; k < n; ++k) z += (float)ps[state->rsp->indices[F5_FACE_SLOT + k]][2];
+                        z /= (float)n;
+                        z = z < 0.0f ? 0.0f : (z > 1.0f ? 1.0f : z);
+                        state->rdp->setPrimDepth((uint16_t)(z * 32767.0f), 0);
+                    }
+                }
                 state->rsp->drawIndexedTri(F5_FACE_SLOT, F5_FACE_SLOT + 1, F5_FACE_SLOT + 2);
                 if (n == 4) state->rsp->drawIndexedTri(F5_FACE_SLOT, F5_FACE_SLOT + 2, F5_FACE_SLOT + 3);
             }
@@ -1309,7 +1425,14 @@ namespace RT64 {
             gbi->map[0xF5] = &setTile_logged;
             gbi->map[0xF6] = &fillRect_op02_aware;
             gbi->map[0xF7] = &setFillColor_overridden;
-            gbi->map[0xB9] = &setOtherModeL_logged;
+            gbi->map[0xB9] = [](State *state, DisplayList **dl) {
+                setOtherModeL_logged(state, dl);
+                if ((state->rdp->otherMode.L & 0x04u) == 0) s_prim_depth_from_game = false;
+            };
+            gbi->map[0xEE] = [](State *state, DisplayList **dl) {
+                GBI_RDP::setPrimDepth(state, dl);
+                s_prim_depth_from_game = true;
+            };
             gbi->map[0xBA] = &setOtherModeH_logged;
             gbi->map[0xED] = &setScissor_logged;
             gbi->map[0xFD] = &setTextureImage_filtered;

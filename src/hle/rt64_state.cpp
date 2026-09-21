@@ -227,7 +227,28 @@ namespace RT64 {
             drawCall.scissorLeftOrigin = rdp->extended.scissorLeftOriginStack[rdp->scissorStackSize - 1];
             drawCall.scissorRightOrigin = rdp->extended.scissorRightOriginStack[rdp->scissorStackSize - 1];
         }
-        
+
+        // F5 skybox dome: force it behind everything. The dome is the only cull=BOTH geometry and
+        // (RenderDoc-confirmed) renders at ndc.z ~0.985 -- NEARER than far world geometry (~0.996) -- so it
+        // occludes the far cut AND bleeds sky colour over distant structures. A skybox must sit at the far
+        // plane. Pin it to max depth via the existing fixed-depth path (zSource=PRIM + primDepth~1 makes
+        // RasterVS output ndc.z~1) so all real geometry wins the depth test, and drop its depth-write so it
+        // never occludes anything. ROGUESQ_F5_SKY_NO_ZWRITE=0 disables for A/B.
+        {
+            static int s_skyFix = -1;
+            if (s_skyFix < 0) { const char *e = std::getenv("ROGUESQ_F5_SKY_NO_ZWRITE"); s_skyFix = (e && e[0] == '0') ? 0 : 1; }
+            if (s_skyFix && rsp->cullBothMask != 0 && (drawCall.geometryMode & rsp->cullBothMask) == rsp->cullBothMask) {
+                // Keep Z_UPD ON: the dome must WRITE its far-plane depth every frame. It is the sky
+                // region's per-frame z refresh -- with the write off, sky pixels keep stale depth, and the
+                // player ship (drawn at ~the same screen spot each frame) fails LESS against its own
+                // previous-frame depth and vanishes against the sky while still showing over terrain
+                // (which rewrites fresh depth). At 0.99999 the dome is behind everything, so writing
+                // never occludes.
+                drawCall.otherMode.L |= (uint32_t)(G_ZS_PRIM | Z_UPD);
+                drawCall.rdpParams.primDepth = { 0.99999f, 0.0f };   // just under the 1.0 clear; remap T (0.995) stays well below
+            }
+        }
+
         if (drawStatus.isChanged(DrawAttribute::Texture) || textureCheck) {
             // Detect the tile count based on the LOD setting.
             const bool usesLOD = (drawCall.otherMode.textLOD() == G_TL_LOD);
@@ -1028,7 +1049,10 @@ namespace RT64 {
                             // GPU culling is the real cull (the CPU path only swaps winding), so it must follow the
                             // same F5 rule: only the back bit culls. Bit 0x1000 alone is a texcoord flag and never
                             // culls -- front-culling it dropped the radar disc and sweep.
-                            flags.culling = (cullBits == (callDesc.cullBothMask & ~callDesc.cullFrontMask));
+                            // ROGUESQ_F5_GPU_NOCULL=1: A/B -- disable the real (GPU) cull for every F5 draw.
+                            static int s_gpuNoCull = -1;
+                            if (s_gpuNoCull < 0) { const char *e = std::getenv("ROGUESQ_F5_GPU_NOCULL"); s_gpuNoCull = (e && e[0] == '1') ? 1 : 0; }
+                            flags.culling = !s_gpuNoCull && (cullBits == (callDesc.cullBothMask & ~callDesc.cullFrontMask));
                         }
                         else {
                             flags.culling = (cullBits != 0) && (cullBits != callDesc.cullBothMask);

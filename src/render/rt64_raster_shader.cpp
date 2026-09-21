@@ -314,7 +314,13 @@ namespace RT64 {
         pipelineDesc.cullMode = c.culling ? RenderCullMode::FRONT : RenderCullMode::NONE;
         pipelineDesc.depthClipEnabled = !c.NoN;
         pipelineDesc.depthEnabled = c.zCmp || c.zUpd;
-        pipelineDesc.depthFunction = c.zCmp ? RenderComparisonFunction::LESS : RenderComparisonFunction::ALWAYS;
+        // N64 RDP depth compare passes ties (its test carries a dz tolerance: "not farther" passes), so
+        // surfaces clamped to the same far-plane depth resolve by draw order -- the horizon haze overlay
+        // blends over beyond-far water. Strict LESS made the later-drawn haze lose on the tie -> a hard
+        // line along the water's far row. ROGUESQ_DEPTH_STRICT_LESS=1 restores LESS for A/B.
+        static int s_strictLess = -1;
+        if (s_strictLess < 0) { const char *e = std::getenv("ROGUESQ_DEPTH_STRICT_LESS"); s_strictLess = (e && e[0] == '1') ? 1 : 0; }
+        pipelineDesc.depthFunction = c.zCmp ? (s_strictLess ? RenderComparisonFunction::LESS : RenderComparisonFunction::LESS_EQUAL) : RenderComparisonFunction::ALWAYS;
         pipelineDesc.depthWriteEnabled = c.zUpd;
         pipelineDesc.depthTargetFormat = RenderFormat::D32_FLOAT;
         pipelineDesc.multisampling = c.multisampling;

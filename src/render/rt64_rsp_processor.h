@@ -15,6 +15,8 @@ namespace RT64 {
             uint32_t vertexCount;
             float prevFrameWeight;
             float curFrameWeight;
+            uint32_t farDepthClamp;
+            uint32_t padding;
         };
 
         struct ModifyCB {

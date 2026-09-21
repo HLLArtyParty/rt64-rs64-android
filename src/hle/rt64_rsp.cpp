@@ -705,7 +705,21 @@ namespace RT64 {
             const hlslpp::float4 tfPos = hlslpp::mul(hlslpp::float4(posFloats[floatIndex + 0], posFloats[floatIndex + 1], posFloats[floatIndex + 2], 1.0f), mvp);
             const interop::RSPViewport &viewport = viewportStack[viewportStackSize - 1];
             posTransformed.emplace_back(tfPos);
-            posScreen.emplace_back((tfPos.xyz / hlslpp::float3(tfPos.w, -tfPos.w, tfPos.w)) * viewport.scale + viewport.translate);
+            hlslpp::float3 ps = (tfPos.xyz / hlslpp::float3(tfPos.w, -tfPos.w, tfPos.w)) * viewport.scale + viewport.translate;
+            // F5: N64-style far-plane depth CLAMP. RS64's projection asymptotes ndc.z past 1.0, and the
+            // RDP clamps everything beyond the far plane to one max z, so far overlays (the horizon haze
+            // strips) TIE with beyond-far water and LEQUAL lets the later draw blend over it. Preserving
+            // order past the far plane instead made the farther haze always lose -> a hard line along the
+            // water's far row (the horizon "ring"). Clamp to the depth of ndc.z=1. ROGUESQ_F5_FAR_ZCLAMP=0 A/B.
+            if (f5Cull) {
+                static int s_zc = -1; if (s_zc < 0) { const char *e = std::getenv("ROGUESQ_F5_FAR_ZCLAMP"); s_zc = (e && e[0] == '0') ? 0 : 1; }
+                if (s_zc) {
+                    const float zmax = (float)viewport.scale.z + (float)viewport.translate.z;
+                    const float px = ps.x, py = ps.y, pz = ps.z;
+                    if (pz > zmax) ps = hlslpp::float3(px, py, zmax);
+                }
+            }
+            posScreen.emplace_back(ps);
             floatIndex += 3;
         }
 
@@ -770,7 +784,16 @@ namespace RT64 {
         const hlslpp::float4 pt = posTransformed[ga] + (posTransformed[gb] - posTransformed[ga]) * t;
         posTransformed.emplace_back(pt);
         const interop::RSPViewport &viewport = viewportStack[viewportStackSize - 1];
-        posScreen.emplace_back((pt.xyz / hlslpp::float3(pt.w, -pt.w, pt.w)) * viewport.scale + viewport.translate);
+        hlslpp::float3 ps = (pt.xyz / hlslpp::float3(pt.w, -pt.w, pt.w)) * viewport.scale + viewport.translate;
+        if (f5Cull) {   // same far-plane depth clamp as setVertex (see there)
+            static int s_zc = -1; if (s_zc < 0) { const char *e = std::getenv("ROGUESQ_F5_FAR_ZCLAMP"); s_zc = (e && e[0] == '0') ? 0 : 1; }
+            if (s_zc) {
+                const float zmax = (float)viewport.scale.z + (float)viewport.translate.z;
+                const float px = ps.x, py = ps.y, pz = ps.z;
+                if (pz > zmax) ps = hlslpp::float3(px, py, zmax);
+            }
+        }
+        posScreen.emplace_back(ps);
         return newIndex;
     }
 
@@ -1147,6 +1170,18 @@ namespace RT64 {
             c = a;
             a = swap;
         }
+        // ROGUESQ_F5_CULL_SWAP=1: A/B -- for F5 back-culled draws, reverse the winding so the GPU's
+        // FRONT-cull removes the true back face. The F5 y-flipped viewport mirrors winding relative to
+        // stock F3DEX, so the wrong side may be culled (ships render inside-out; no-cull-bit structures fine).
+        {
+            static int s_cullSwap = -1;
+            if (s_cullSwap < 0) { const char *e = std::getenv("ROGUESQ_F5_CULL_SWAP"); s_cullSwap = (e && e[0] == '1') ? 1 : 0; }
+            if (s_cullSwap && f5Cull && (geometryMode & cullBothMask) == (cullBothMask & ~cullFrontMask)) {
+                uint8_t swap = c;
+                c = a;
+                a = swap;
+            }
+        }
         
         auto &faceIndices = workload.drawData.faceIndices;
         auto &viewProjIndices = workload.drawData.viewProjIndices;
@@ -1170,6 +1205,64 @@ namespace RT64 {
 
         // Indicates the vertex has been used in a tri. Whatever routines modify the vertex afterwards must use a new index instead.
 
+        // ROGUESQ_F5_DEPTH_PROBE=1: split submitted tris into dome (extreme NDC / w<=near) vs normal world,
+        // to settle whether the horizon cut is draw-distance (world maxNdcZ stops short of 1) or occlusion
+        // (world reaches ~1 AND the dome writes depth). worldZupMaxNdcZ = deepest depth-writing world tri.
+        {
+            static int s_probe = -1;
+            if (s_probe < 0) { const char* e = std::getenv("ROGUESQ_F5_DEPTH_PROBE"); s_probe = (e && e[0] && e[0] != '0') ? 1 : 0; }
+            if (s_probe) {
+                const auto &pt = workload.drawData.posTransformed;
+                const bool zup = otherModeStack[otherModeStackSize - 1].zUpd();
+                bool dome = false;
+                float maxNdc = -1e9f, minNdc = 1e9f;
+                for (int i = 0; i < 3; i++) {
+                    const hlslpp::float4 p = pt[globalIndices[i]];
+                    const float w = p.w, px = p.x, py = p.y, pz = p.z;
+                    if (w <= 1e-4f) { dome = true; continue; }
+                    const float nz = pz / w;
+                    if (nz > maxNdc) maxNdc = nz;
+                    if (nz < minNdc) minNdc = nz;
+                    if ((px < 0.0f ? -px : px) > 2.0f * w || (py < 0.0f ? -py : py) > 2.0f * w) dome = true;
+                }
+                static float s_worldMax = -1e9f, s_worldZupMax = -1e9f, s_domeMin = 1e9f, s_domeMax = -1e9f;
+                static int s_domeN = 0, s_domeZup = 0, s_worldN = 0, s_n = 0;
+                if (dome) { s_domeN++; if (zup) s_domeZup++; if (minNdc < s_domeMin) s_domeMin = minNdc; if (maxNdc > s_domeMax && maxNdc < 1e8f) s_domeMax = maxNdc; }
+                else { s_worldN++; if (maxNdc > s_worldMax) s_worldMax = maxNdc; if (zup && maxNdc > s_worldZupMax) s_worldZupMax = maxNdc; }
+                // cull=BOTH characterization: how do the dome's cull=BOTH tris differ from the tall
+                // structures' cull=BOTH tris? Bucket by wrapped(w<=near), huge/mid/small |ndc|, + zUpd.
+                {
+                    const bool cb = cullBothMask != 0 && (geometryMode & cullBothMask) == cullBothMask;
+                    static int cbN = 0, cbWrap = 0, cbHuge = 0, cbMid = 0, cbSmall = 0, cbZup = 0; static float cbZmin = 1e9f, cbZmax = -1e9f;
+                    if (cb) {
+                        cbN++; if (zup) cbZup++;
+                        float mAbs = 0.0f; bool wrap = false;
+                        for (int i = 0; i < 3; i++) {
+                            const hlslpp::float4 p = pt[globalIndices[i]];
+                            const float w = p.w, px = p.x, py = p.y, pz = p.z;
+                            if (w <= 1e-4f) { wrap = true; continue; }
+                            const float ax = (px < 0 ? -px : px) / w, ay = (py < 0 ? -py : py) / w;
+                            if (ax > mAbs) mAbs = ax; if (ay > mAbs) mAbs = ay;
+                            const float nz = pz / w; if (nz < cbZmin) cbZmin = nz; if (nz > cbZmax && nz < 1e8f) cbZmax = nz;
+                        }
+                        if (wrap) cbWrap++; else if (mAbs > 20.0f) cbHuge++; else if (mAbs > 3.0f) cbMid++; else cbSmall++;
+                    }
+                    static int cbFrame = 0;
+                    if (++cbFrame >= 4000) { std::fprintf(stderr, "[f5-cullboth] N=%d zUpd=%d wrap=%d huge=%d mid=%d small=%d ndcZ[%.4f..%.4f]\n",
+                        cbN, cbZup, cbWrap, cbHuge, cbMid, cbSmall, cbZmin, cbZmax); std::fflush(stderr);
+                        cbN = cbWrap = cbHuge = cbMid = cbSmall = cbZup = 0; cbZmin = 1e9f; cbZmax = -1e9f; cbFrame = 0; }
+                }
+                if (++s_n >= 4000) {
+                    std::fprintf(stderr, "[f5-depth] worldMaxNdcZ=%.4f worldZupMaxNdcZ=%.4f | domeN=%d domeZup=%d domeNdcZ[%.4f..%.4f]\n",
+                        s_worldMax, s_worldZupMax, s_domeN, s_domeZup, s_domeMin, s_domeMax); std::fflush(stderr);
+                    s_worldMax = s_worldZupMax = -1e9f; s_domeMin = 1e9f; s_domeMax = -1e9f; s_domeN = s_domeZup = s_worldN = 0; s_n = 0;
+                }
+            }
+        }
+
+        // (Skybox dome depth handling moved to State::loadDrawState: pin the cull=BOTH dome to max depth
+        // via zSource=PRIM so it sits behind everything. See rt64_state.cpp.)
+
         // Full-frustum CPU clipping (default on; ROGUESQ_F5_NO_NEAR_CLIP=1 disables). RS64's skybox dome
         // is a small mesh scaled ~25x and wrapped around the camera, so its triangles are gigantic in clip
         // space (NDC coords in the tens-to-hundreds) and/or cross the near plane (w<=0). Hardware's RSP
@@ -1190,15 +1283,48 @@ namespace RT64 {
             if (s_clip < 0) { const char* e = std::getenv("ROGUESQ_F5_NO_NEAR_CLIP"); s_clip = (e && e[0] == '1') ? 0 : 1; }
 
             bool extreme = false;
+            bool anyNear = false;
             if (s_clip && !degenerate) {
                 for (int i = 0; i < 3; i++) {
                     const hlslpp::float4 p = workload.drawData.posTransformed[globalIndices[i]];
                     const float pw = p.w, px = p.x, py = p.y;
-                    if (pw <= kNearW) { extreme = true; break; }
+                    if (pw <= kNearW) { extreme = true; anyNear = true; break; }
                     const float apx = px < 0.0f ? -px : px;
                     const float apy = py < 0.0f ? -py : py;
                     if (apx > kGuard * pw || apy > kGuard * pw) { extreme = true; break; }
                 }
+            }
+            // The skybox dome (the only cull=BOTH geometry) is pinned to a flat far-plane primDepth in
+            // State::loadDrawState. That revives its BACK hemisphere: those tris (101 of 149 sit behind
+            // the camera) used to be discarded by the GPU depth range after near-clipping, but a forced
+            // valid depth draws their near-plane cap at the far plane -> a horizontal "ring" across the
+            // sky. The front hemisphere alone covers the whole view, so drop any dome tri that touches
+            // the near plane. ROGUESQ_F5_DOME_DROP_BACK=0 disables for A/B.
+            const bool isDomeTri = cullBothMask != 0 && (geometryMode & cullBothMask) == cullBothMask;
+            // ROGUESQ_F5_DEPTH_PROBE=1: per dome tri, log path + screen NDC of its 3 verts.
+            if (isDomeTri) {
+                static int s_dp = -1; if (s_dp < 0) { const char *e = std::getenv("ROGUESQ_F5_DEPTH_PROBE"); s_dp = (e && e[0] && e[0] != '0') ? 1 : 0; }
+                if (s_dp) {
+                    static int dn = 0; ++dn;
+                    if (dn <= 400 || (dn % 500) == 0) {
+                        float nx[3], ny[3], nw[3];
+                        for (int i = 0; i < 3; i++) {
+                            const hlslpp::float4 p = workload.drawData.posTransformed[globalIndices[i]];
+                            const float pw = p.w, px = p.x, py = p.y;
+                            nw[i] = pw;
+                            nx[i] = (pw > 1e-4f) ? (px / pw) : 999.0f;
+                            ny[i] = (pw > 1e-4f) ? (py / pw) : 999.0f;
+                        }
+                        std::fprintf(stderr, "[dome-tri] #%d %s%s w=(%.0f %.0f %.0f) ndc=(%.2f,%.2f)(%.2f,%.2f)(%.2f,%.2f)\n", dn,
+                            extreme ? "EXTREME" : "normal", anyNear ? "+near" : "", nw[0], nw[1], nw[2], nx[0], ny[0], nx[1], ny[1], nx[2], ny[2]);
+                        std::fflush(stderr);
+                    }
+                }
+            }
+            if (anyNear && isDomeTri) {
+                static int s_dropBack = -1;
+                if (s_dropBack < 0) { const char *e = std::getenv("ROGUESQ_F5_DOME_DROP_BACK"); s_dropBack = (e && e[0] == '0') ? 0 : 1; }
+                if (s_dropBack) return;
             }
 
             if (extreme) {
@@ -1234,6 +1360,12 @@ namespace RT64 {
                     }
                     polyN = outCnt;
                     for (int i = 0; i < polyN; i++) poly[i] = out[i];
+                }
+                // ROGUESQ_F5_DEPTH_PROBE=1: what the clipper left of a dome tri.
+                if (isDomeTri) {
+                    static int s_dp2 = -1; if (s_dp2 < 0) { const char *e = std::getenv("ROGUESQ_F5_DEPTH_PROBE"); s_dp2 = (e && e[0] && e[0] != '0') ? 1 : 0; }
+                    if (s_dp2) { static int cn = 0; ++cn; if (cn <= 400 || (cn % 500) == 0) {
+                        std::fprintf(stderr, "[dome-clip] #%d polyN=%d fanTris=%d\n", cn, polyN, polyN >= 3 ? polyN - 2 : 0); std::fflush(stderr); } }
                 }
                 // appendClippedVertex reallocated the drawData vectors; access them fresh (the outer
                 // faceIndices/worldIndices/posScreen/tcFloats references may now dangle).
