@@ -43,6 +43,9 @@
 #include <cstring>
 #include <vector>
 #include <utility>
+#include <unordered_set>
+#include <unordered_map>
+#include <cmath>
 
 extern "C" volatile unsigned g_most_drawn_fb = 0;
 extern "C" volatile unsigned g_most_drawn_fb_width = 0;  // width of g_most_drawn_fb's color image
@@ -88,6 +91,89 @@ namespace RT64 {
             return s;
         }
 
+        // ---- Per-object node-id map for frame interpolation (ROGUESQ_F5_NODE_ID) ----
+        // The game writes each scene node's world matrix into a double-buffered ring (buffer A
+        // 0x80700040+, buffer B 0x80710040+, 0x40-stride submit-order slots). A game-side hook on
+        // traverseSceneGraphRecursive's matrix-write site calls rs64_f5_map_node(ringDst, nodeId)
+        // per object, so op_01_matrix can stamp the stable scene-node identity as the interpolation
+        // matrixId and pair the same object across frames regardless of submit-order shuffle. The
+        // map is rebuilt every frame (a buffer's map clears when its slot 0 is written), so it can't
+        // accumulate the stale mappings that made the earlier persistent pointer map warp.
+        static bool f5_node_id_enabled() {
+            static bool s = env_on("ROGUESQ_F5_NODE_ID", false);
+            return s;
+        }
+        // ROGUESQ_F5_VTX_INTERP=1: also interpolate per-vertex positions/texcoords for id-matched
+        // objects (AUTO = only when vertex counts match and hashes differ), to smooth F5's vertex-
+        // baked motion (terrain LOD morph). SKIP by default (transform-only).
+        static bool f5_vtx_interp_enabled() {
+            static bool s = env_on("ROGUESQ_F5_VTX_INTERP", false);
+            return s;
+        }
+        // ROGUESQ_F5_TERRAIN_ID=1: id scrolling terrain tiles by quantized world position (stable
+        // per world cell across grid re-centers) instead of the reused slot/node pointer.
+        static bool f5_terrain_id_enabled() {
+            static bool s = env_on("ROGUESQ_F5_TERRAIN_ID", false);
+            return s;
+        }
+        static constexpr uint32_t F5_NODE_MAP_SLOTS = 256;
+        static uint32_t s_node_map[2][F5_NODE_MAP_SLOTS] = {};   // [buffer][slot] = stamped id (0 = leave AUTO)
+        // A node only gets an interpolation id if it existed last frame (stable). Transient nodes
+        // (per-frame terrain tessellation, just-spawned objects) are not paired by id — they fall
+        // back to AUTO geometric matching, which handles deforming terrain far better than a
+        // never-matching linear id (that would drop interpolation and stutter).
+        static std::unordered_set<uint32_t> s_nodes_prev, s_nodes_cur;
+        // Per-buffer histogram of drawable pointers (renderNode = *(node+0x10); drawable = renderNode+0x08).
+        // A drawable used by exactly one node this frame = a distinct model instance (ship) that benefits
+        // from stable-id interpolation; a shared drawable = instanced particles / terrain tiles that
+        // flicker or morph under it. Rebuilt at each frame's first slot. Requires RDRAM (op_01 side).
+        static std::unordered_map<uint32_t, int> s_draw_hist[2];
+        static uint32_t f5_node_drawable(const uint8_t* ram, uint32_t node) {
+            const uint32_t rn = rd_be_u32(ram, node + 0x10);
+            return (rn >= 0x80000000u) ? rd_be_u32(ram, rn + 0x08) : 0u;
+        }
+        static void f5_rebuild_draw_hist(const uint8_t* ram, int buf) {
+            s_draw_hist[buf].clear();
+            for (uint32_t i = 0; i < F5_NODE_MAP_SLOTS; ++i) {
+                const uint32_t node = s_node_map[buf][i];
+                if (node < 0x80000000u) continue;
+                const uint32_t dr = f5_node_drawable(ram, node);
+                if (dr >= 0x80000000u) ++s_draw_hist[buf][dr];
+            }
+        }
+        static inline int f5_ring_buffer(uint32_t off) { return (off & 0x10000u) ? 1 : 0; }
+        static inline int f5_ring_slot(uint32_t off) {
+            const uint32_t rel = (off & 0xFFFFu);
+            if (rel < 0x40u) return -1;
+            const uint32_t s = (rel - 0x40u) / 0x40u;
+            return s < F5_NODE_MAP_SLOTS ? (int)s : -1;
+        }
+        void f5_map_node_impl(uint32_t ringDst, uint32_t nodeId) {
+            const uint32_t off = ringDst & 0x00FFFFFFu;
+            if (off < 0x700000u || off >= 0x720000u) return;
+            const int buf = f5_ring_buffer(off);
+            const int slot = f5_ring_slot(off);
+            if (slot < 0) return;
+            if (slot == 0) {   // slot 0 = start of a new frame (one per frame, in the active buffer)
+                for (uint32_t i = 0; i < F5_NODE_MAP_SLOTS; ++i) s_node_map[buf][i] = 0;
+                s_nodes_prev.swap(s_nodes_cur);
+                s_nodes_cur.clear();
+            }
+            s_nodes_cur.insert(nodeId);
+            // Store the raw node pointer for nodes present last frame (stable); 0 = leave AUTO.
+            // op_01 reads the node's flags via RDRAM to classify before stamping an id.
+            s_node_map[buf][slot] = s_nodes_prev.count(nodeId) ? nodeId : 0u;
+        }
+        // Look up the id a hook stored for this ring address; 0 if none.
+        static uint32_t f5_lookup_node_id(uint32_t w1) {
+            const uint32_t off = w1 & 0x00FFFFFFu;
+            if (off < 0x700000u || off >= 0x720000u) return 0;
+            const int buf = f5_ring_buffer(off);
+            const int slot = f5_ring_slot(off);
+            if (slot < 0) return 0;
+            return s_node_map[buf][slot];
+        }
+
         // Kept for the sibling modules' declarations (the software MVP composer is gone).
         bool f5_compose_mvp(const uint8_t*, float Mout[12]) {
             for (int i = 0; i < 12; ++i) Mout[i] = 0.0f;
@@ -117,10 +203,26 @@ namespace RT64 {
             return b1 == b0 + 1 && b2 == b0 + 2 && b3 == b0 + 3;
         }
 
-        void op_noop(State*, DisplayList**) {}
+        // ROGUESQ_DROP_PROBE: log dropped/no-op'd F5 commands (opcode + payload + a few following
+        // words), deduped by opcode. If a particle/sprite batch command is being silently consumed,
+        // it shows here with structured (non-filler) payload.
+        static void drop_log(const char* who, DisplayList** dl) {
+            static bool s_on = env_on("ROGUESQ_DROP_PROBE", false);
+            if (!s_on) return;
+            const uint32_t w0 = (*dl)->w0, w1 = (*dl)->w1;
+            const uint8_t op = (uint8_t)(w0 >> 24);
+            static std::unordered_map<uint8_t, uint32_t> s_cnt;
+            uint32_t& c = s_cnt[op]; ++c;
+            if (c <= 3 || (c % 2000) == 0) {
+                std::fprintf(stderr, "[drop %s] op=%02X cnt=%u w0=%08X w1=%08X next=[%08X %08X %08X %08X]\n",
+                    who, op, c, w0, w1, (*dl)[1].w0, (*dl)[1].w1, (*dl)[2].w0, (*dl)[2].w1);
+                std::fflush(stderr);
+            }
+        }
+        void op_noop(State*, DisplayList** dl) { drop_log("noop", dl); }
 
         // Skip the 8-byte payload of a 16-byte command.
-        void op_consume16(State*, DisplayList** dl) { (*dl)++; }
+        void op_consume16(State*, DisplayList** dl) { drop_log("c16", dl); (*dl)++; }
         // Skip the 24-byte payload of a 32-byte command.
         void op_consume32(State*, DisplayList** dl) { (*dl) += 3; }
 
@@ -599,6 +701,99 @@ namespace RT64 {
             const bool proj = (((w0 >> 16) & 0xFF) == 0x03) || (m33 == 0 && m23 != 0);
             if (!f5_native_active()) return;
             f5_ensure_viewport(state);
+
+            // ROGUESQ_F5_SLOT_ID (default off): stamp each per-object modelview with a frame-stable
+            // matrixId so RT64 pairs the same object across frames by id (ORDER_LINEAR) instead of
+            // by geometry. The object's model*view matrix is written into a double-buffered ring
+            // (0x80700040 even frames / 0x80710040 odd, 0x40-stride submit-order slots); the low 16
+            // bits of the address are identical in both buffers, so (w1 & 0xFFFF) is the slot id with
+            // no buffer-flip and no persistent state to go stale. Recomputed every frame from the
+            // live stream, so it self-corrects on spawn/despawn instead of accumulating mispairs.
+            if (!proj) {
+                  // Prefer the stable scene-node id (populated by the game hook) when enabled; fall
+                  // back to the submit-order slot id (ROGUESQ_F5_SLOT_ID, experiment) otherwise.
+                  uint32_t id = 0;
+                  bool isTerrain = false;
+                  if (f5_node_id_enabled()) {
+                      const uint32_t nodePtr = f5_lookup_node_id(w1);   // raw node ptr, or 0
+                      if (nodePtr >= 0x80000000u) {
+                          // Default stamps every stable node (ships smooth; the best result found).
+                          // ROGUESQ_F5_UNIQUE_ONLY=1 restricts to nodes with a unique drawable this
+                          // frame — excludes particle templates and terrain tiles, but also drops
+                          // formation ships (identical model = shared drawable), so it is opt-in.
+                          static int s_uniq = -1; if (s_uniq < 0) { const char* e = std::getenv("ROGUESQ_F5_UNIQUE_ONLY"); s_uniq = (e && e[0] == '1') ? 1 : 0; }
+                          bool stamp = true;
+                          if (s_uniq) {
+                              const uint32_t off = w1 & 0x00FFFFFFu;
+                              const int buf = (off & 0x10000u) ? 1 : 0;
+                              if ((off & 0xFFFFu) == 0x40u) f5_rebuild_draw_hist(state->RDRAM, buf);
+                              const uint32_t dr = f5_node_drawable(state->RDRAM, nodePtr);
+                              auto it = s_draw_hist[buf].find(dr);
+                              stamp = (dr >= 0x80000000u) && (it != s_draw_hist[buf].end()) && (it->second == 1);
+                          }
+                          if (stamp) id = 0x20000000u | (nodePtr & 0x00FFFFFFu);
+                          // ROGUESQ_F5_TERRAIN_ID: terrain tiles are a scrolling pool — the node ptr is
+                          // the reused SLOT, which makes RT64 interpolate a slot through the world-cell
+                          // change at a grid re-center (the periodic terrain hitch). Instead, id a
+                          // terrain tile by its WORLD position (node+0x40 X/Z, quantized) so the draw
+                          // showing a given world cell keeps the same id across frames regardless of
+                          // slot, and RT64 interpolates its (camera-relative) transform smoothly.
+                          // Terrain tiles = shared drawable + a real world translation (effects have ~0).
+                          if (f5_terrain_id_enabled()) {
+                              const uint32_t offb = w1 & 0x00FFFFFFu; const int bufb = (offb & 0x10000u) ? 1 : 0;
+                              if ((offb & 0xFFFFu) == 0x40u) f5_rebuild_draw_hist(state->RDRAM, bufb);
+                              const uint32_t dr = f5_node_drawable(state->RDRAM, nodePtr);
+                              auto it = s_draw_hist[bufb].find(dr);
+                              const bool shared = (it != s_draw_hist[bufb].end()) && (it->second > 1);
+                              if (shared) {
+                                  auto rf = [&](uint32_t o){ union{uint32_t u;float f;}c; c.u = rd_be_u32(state->RDRAM, nodePtr + o); return c.f; };
+                                  float wx = rf(0x40), wz = rf(0x48);
+                                  if (fabsf(wx) + fabsf(wz) > 1.0f) {   // real world position => terrain, not an effect at ~origin
+                                      // The tile position is relative to a root that tracks the camera, so it shifts
+                                      // together at each grid re-center. Add the camera world position (camera struct
+                                      // @ MEM[0x80138D1C], horizontal pos +0x4C/+0x50) to get an absolute world cell
+                                      // that survives the re-center. ROGUESQ_F5_TERRAIN_ABS=0 disables the add (A/B).
+                                      static const float cell = [](){ const char* e = std::getenv("ROGUESQ_F5_TERRAIN_CELL"); float f = (e && e[0]) ? (float)atof(e) : 4.0f; return f > 0.01f ? f : 4.0f; }();
+                                      int cx = (int)lroundf(wx / cell), cz = (int)lroundf(wz / cell);
+                                      // Add the camera's world position STEPPED to the cell grid (the root re-centers in
+                                      // discrete cell steps, so use round(cam/cell) not the continuous position, or a
+                                      // per-frame sub-cell fraction makes the id jitter). Yields an absolute cell that
+                                      // survives the re-center. ROGUESQ_F5_TERRAIN_ABS=0 disables (A/B).
+                                      static int s_abs = -1; if (s_abs < 0) { const char* e = std::getenv("ROGUESQ_F5_TERRAIN_ABS"); s_abs = (e && e[0] == '0') ? 0 : 1; }
+                                      if (s_abs) {
+                                          const uint32_t camPtr = rd_be_u32(state->RDRAM, 0x80138D1Cu);
+                                          if (camPtr >= 0x80000000u) {
+                                              union{uint32_t u;float f;}cx2,cz2; cx2.u = rd_be_u32(state->RDRAM, camPtr + 0x4Cu); cz2.u = rd_be_u32(state->RDRAM, camPtr + 0x50u);
+                                              cx += (int)lroundf(cx2.f / cell); cz += (int)lroundf(cz2.f / cell);
+                                          }
+                                      }
+                                      id = 0x60000000u | (((uint32_t)cx & 0xFFFu) << 12) | ((uint32_t)cz & 0xFFFu);
+                                      isTerrain = true;
+                                  }
+                              }
+                          }
+                      }
+                  }
+                  if (id == 0) {
+                      static int s_slotid = -1; if (s_slotid < 0) { const char* e = std::getenv("ROGUESQ_F5_SLOT_ID"); s_slotid = (e && e[0] == '1') ? 1 : 0; }
+                      const uint32_t off = w1 & 0x00FFFFFFu;
+                      if (s_slotid && off >= 0x700000u && off < 0x720000u) id = 0x00010000u | (w1 & 0xFFFFu);
+                  }
+                  if (id != 0) {   // never 0 (IGNORE) or 0xFFFFFFFF (AUTO)
+                      // Terrain geomorph: the PC port interpolates terrain vertices into position (the N64
+                      // snapped). Now that terrain cells have a stable id, enable vertex interpolation for
+                      // them so RT64 blends the right cell's vertices across frames. Ships stay transform-
+                      // only. ROGUESQ_F5_VTX_INTERP forces it on for everything (A/B).
+                      const uint8_t vcomp = (isTerrain || f5_vtx_interp_enabled()) ? G_EX_COMPONENT_AUTO : G_EX_COMPONENT_SKIP;
+                      state->rsp->matrixId(id, /*push*/false, /*proj*/false, /*decompose*/true,
+                          G_EX_COMPONENT_INTERPOLATE, G_EX_COMPONENT_INTERPOLATE, G_EX_COMPONENT_INTERPOLATE,
+                          G_EX_COMPONENT_INTERPOLATE, G_EX_COMPONENT_INTERPOLATE, /*vpos*/vcomp,
+                          /*vtc*/vcomp, /*tile*/G_EX_COMPONENT_AUTO, /*lookat*/G_EX_COMPONENT_AUTO,
+                          /*order*/G_EX_ORDER_LINEAR, /*aspect*/G_EX_ASPECT_AUTO, /*editable*/G_EX_EDIT_NONE,
+                          /*idIsAddress*/false, /*editGroup*/false);
+                  }
+            }
+
             state->rsp->matrix(w1, proj ? 0x03 : 0x02);   // F3D constants: PROJECTION=1, LOAD=2
 
             // ROGUESQ_LOG_FACE_UV: compose the full fixed-point matrix (int part + frac/65536)
@@ -661,6 +856,121 @@ namespace RT64 {
             s_cache_count = n;
         }
 
+        // 0xBD: ucode LOAD OVERLAY 0x2C = camera-facing BILLBOARD sprite -> texrect (see project memory
+        // animated-effect-sprites-invisible). Hardware projects the cached center vertex and emits a
+        // screen-space texrect. First-pass HLE: emit a quad around the cached center (op_04) with the
+        // record color + bound texture, GPU-projected. Gated ROGUESQ_F5_SPRITES (off until validated).
+        void op_bd_sprite(State* state, DisplayList** dl) {
+            static bool s_on = env_on("ROGUESQ_F5_SPRITES", false);
+            const uint32_t w0 = (*dl)->w0, w1 = (*dl)->w1;
+            if (s_on && f5_native_active()) {
+                const uint32_t slot = ((w0 >> 5) & 0x7F8u) / 0x28u;
+                if (slot < s_cache_count && slot < F5_FACE_SLOT) {
+                    const RSP::Vertex* cache = reinterpret_cast<const RSP::Vertex*>(state->fromRDRAM(F5_VTX_SCRATCH));
+                    const RSP::Vertex c = cache[slot];
+                    static int s_szset = 0; static int s_size = 0;
+                    if (!s_szset) { s_szset = 1; const char* v = std::getenv("ROGUESQ_F5_SPRITE_SIZE"); s_size = (v && *v) ? std::atoi(v) : 0; }
+                    { static int n=0; ++n; if (env_on("ROGUESQ_F5_SPRITE_LOG", false) && (n<=16)) {
+                        // Decode the fire texture's corner (bg) texel vs a center texel as RGBA16(5551):
+                        // tells us if the black bg is RGB=0 opaque (additive), dark-nonzero, or alpha=0.
+                        const uint32_t tsrc2 = state->rdp->texture.address & 0x00FFFFFFu;
+                        auto rd16 = [&](uint32_t off)->uint16_t { uint32_t a=(tsrc2+off)&0x00FFFFFFu; return (uint16_t)((state->RDRAM[a^3]<<8)|state->RDRAM[(a+1)^3]); };
+                        auto dec = [](uint16_t p, int c[4]){ c[0]=((p>>11)&0x1F)<<3; c[1]=((p>>6)&0x1F)<<3; c[2]=((p>>1)&0x1F)<<3; c[3]=(p&1)*255; };
+                        int bg[4], ct[4]; dec(rd16(0), bg); dec(rd16(40*20*2 + 20*2), ct);
+                        std::fprintf(stderr, "[bd-tex] tex=%06X bgTexel=(%d,%d,%d a=%d) ctrTexel=(%d,%d,%d a=%d)\n",
+                            tsrc2, bg[0],bg[1],bg[2],bg[3], ct[0],ct[1],ct[2],ct[3]);
+                        const auto& vmL = state->rsp->viewMatrixStack[state->rsp->projectionMatrixStackSize - 1];
+                        std::fprintf(stderr, "[bd-view] projStk=%d row0=(%.3f %.3f %.3f) row1=(%.3f %.3f %.3f) | mvp row0=(%.3f %.3f %.3f)\n",
+                            state->rsp->projectionMatrixStackSize,
+                            (float)vmL[0][0],(float)vmL[1][0],(float)vmL[2][0], (float)vmL[0][1],(float)vmL[1][1],(float)vmL[2][1],
+                            (float)state->rsp->modelViewProjMatrix[0][0],(float)state->rsp->modelViewProjMatrix[1][0],(float)state->rsp->modelViewProjMatrix[2][0]);
+                        const LoadTile& T = state->rdp->tiles[0];
+                        const auto& comb = state->rdp->colorCombinerStack[state->rdp->colorCombinerStackSize - 1];
+                        std::fprintf(stderr, "[bd] #%d w0=%08X w1=%08X rec=[%08X %08X] slot=%u center=(%d,%d,%d) | tex=%06X tile[fmt=%u siz=%u uls=%u ult=%u lrs=%u lrt=%u line=%u] combL=%08X combH=%08X otherL=%08X otherH=%08X cimg=%06X\n",
+                            n, w0, w1, (*dl)[1].w0, (*dl)[1].w1, slot, (int)c.x,(int)c.y,(int)c.z,
+                            state->rdp->texture.address & 0x00FFFFFFu, T.fmt, T.siz, T.uls, T.ult, T.lrs, T.lrt, T.line, comb.L, comb.H,
+                            state->rdp->otherMode.L, state->rdp->otherMode.H, state->rdp->colorImage.address & 0x00FFFFFFu);
+                        std::fflush(stderr);
+                    } }
+                    int16_t half = (int16_t)((*dl)[1].w1 & 0xFFFFu);   // rec[1] = (S,S) half-size
+                    if (half <= 0 || half > 4000) half = 40;
+                    if (s_size) half = (int16_t)s_size;         // ROGUESQ_F5_SPRITE_SIZE override for tuning
+                    // UV spans the actual bound tile (lrs/lrt are 10.2 fixed -> +1 texel), S10.5 into the vertex.
+                    const LoadTile& T = state->rdp->tiles[0];
+                    const int16_t tw = (int16_t)(((T.lrs - T.uls) >> 2) + 1) << 5;
+                    const int16_t th = (int16_t)(((T.lrt - T.ult) >> 2) + 1) << 5;
+                    RSP::Vertex* tmp = reinterpret_cast<RSP::Vertex*>(state->fromRDRAM(F5_VTX_SCRATCH + F5_FACE_SLOT * sizeof(RSP::Vertex)));
+                    const int16_t us[4] = { 0, tw, 0, tw }, vt[4] = { 0, 0, th, th };
+                    const float sgx[4] = { -1, 1, -1, 1 }, sgy[4] = { -1, -1, 1, 1 };
+                    // Camera-facing billboard. F5's view matrix is identity (camera is baked into the MVP),
+                    // so derive the world directions that project to pure screen X/Y from the MVP rows:
+                    //   screenRight_world = cross(clipY_coeffs, clipW_coeffs)
+                    //   screenUp_world    = cross(clipW_coeffs, clipX_coeffs)
+                    const auto& mv = state->rsp->modelViewProjMatrix;
+                    const float cX[3] = { (float)mv[0][0], (float)mv[1][0], (float)mv[2][0] };  // clip.x coeffs
+                    const float cY[3] = { (float)mv[0][1], (float)mv[1][1], (float)mv[2][1] };  // clip.y coeffs
+                    const float cW[3] = { (float)mv[0][3], (float)mv[1][3], (float)mv[2][3] };  // clip.w coeffs
+                    auto cross = [](const float a[3], const float b[3], float o[3]) {
+                        o[0] = a[1]*b[2] - a[2]*b[1]; o[1] = a[2]*b[0] - a[0]*b[2]; o[2] = a[0]*b[1] - a[1]*b[0];
+                    };
+                    auto norm = [](float v[3]) { float l = std::sqrt(v[0]*v[0]+v[1]*v[1]+v[2]*v[2]); if (l > 1e-6f) { v[0]/=l; v[1]/=l; v[2]/=l; } };
+                    float R[3], U[3]; cross(cY, cW, R); cross(cW, cX, U); norm(R); norm(U);
+                    float rx = R[0], ry = R[1], rz = R[2], ux = U[0], uy = U[1], uz = U[2];
+                    const bool haveView = (rx*rx + ry*ry + rz*rz) > 0.01f && (ux*ux + uy*uy + uz*uz) > 0.01f;
+                    for (int k = 0; k < 4; ++k) {
+                        tmp[k] = c;
+                        const float dx = sgx[k] * (float)half, dy = sgy[k] * (float)half;
+                        if (haveView) {
+                            tmp[k].x = (int16_t)(c.x + dx * rx + dy * ux);
+                            tmp[k].y = (int16_t)(c.y + dx * ry + dy * uy);
+                            tmp[k].z = (int16_t)(c.z + dx * rz + dy * uz);
+                        } else {
+                            tmp[k].x = (int16_t)(c.x + dx);
+                            tmp[k].y = (int16_t)(c.y + dy);
+                        }
+                        tmp[k].s = us[k]; tmp[k].t = vt[k];
+                        tmp[k].color.r = tmp[k].color.g = tmp[k].color.b = tmp[k].color.a = 0xFF;  // white; PRIM carries the color
+                    }
+                    // The game's sprite combiner (FC11A7FF) takes alpha from an UNBOUND TEXEL1 -> garbage
+                    // alpha -> the sprite blends with the background. Use the proven MODULATEIA combiner
+                    // (== attribution text: color TEXEL0*PRIM, alpha TEXEL0_a*PRIM_a) + 1-cycle alpha-over,
+                    // and drive the color/fade via PRIM = record w1. ROGUESQ_F5_SPRITE_RAWCOMB keeps the
+                    // game's combiner for A/B.
+                    static bool s_rawcomb = env_on("ROGUESQ_F5_SPRITE_RAWCOMB", false);
+                    // Combiner: COLOR = TEXEL0*PRIM (the game's fire texture is orange; PRIM carries the
+                    // per-sprite tint from the record), ALPHA = TEXEL1*PRIM_a. The game keys the transparent
+                    // background via TEXEL1 (the same fire texture sampled a second time) -> bind tile1=tile0
+                    // so TEXEL1 supplies the alpha mask. (Game's own 2-cycle combiner washes the color to
+                    // white; TEXEL0-alpha in 1-cycle didn't key.) 1-cycle alpha-over. ROGUESQ_F5_SPRITE_RAW=1
+                    // keeps the game's combiner/blend for A/B.
+                    state->rdp->tiles[1] = state->rdp->tiles[0];
+                    static bool s_rawc = env_on("ROGUESQ_F5_SPRITE_RAW", false);
+                    if (!s_rawc) {
+                        // DECAL, 2-cycle (1-cycle can't sample TEXEL1): COLOR = TEXEL0 (the texture's own
+                        // orange, no PRIM to desaturate), ALPHA = TEXEL1 = the same fire texture's alpha =
+                        // the wispy shape, which clips the transparent background. cyc2 passthrough color.
+                        state->rdp->setCombine((uint64_t(0xFFFCFE3Au) << 32) | uint64_t(0x00FFFFFFu));  // color=TEXEL0, alpha=TEXEL1
+                        state->rdp->setOtherMode(0x00180CFFu, 0xC4104A54u | 0x1u);   // 2-cycle alpha-over + test
+                        state->rdp->setBlendColor(0x00000020u);
+                    }
+                    { static int t = -1; if (t < 0) { const char* v = std::getenv("ROGUESQ_F5_SPRITE_PRIM"); t = (v && *v) ? (int)strtoul(v, nullptr, 0) : -2; }
+                      state->rdp->setPrimColor(0, 0xFF, (t >= 0) ? (uint32_t)t : w1); }
+                    // Billboards are UNLIT (hw draws them as screen-space texrects). Force lighting off
+                    // so the scene's environment light doesn't modulate the sprite (white-scene -> white,
+                    // dark-scene -> black). Restore the mode after.
+                    uint32_t& gm = state->rsp->geometryModeStack[state->rsp->geometryModeStackSize - 1];
+                    const uint32_t savedGM = gm;
+                    gm &= ~(uint32_t)G_LIGHTING;
+                    state->rsp->setVertex(0x80000000u | (F5_VTX_SCRATCH + F5_FACE_SLOT * sizeof(RSP::Vertex)), 4, F5_FACE_SLOT);
+                    state->rsp->drawIndexedTri(F5_FACE_SLOT, F5_FACE_SLOT + 3, F5_FACE_SLOT + 2);
+                    state->rsp->drawIndexedTri(F5_FACE_SLOT, F5_FACE_SLOT + 1, F5_FACE_SLOT + 3);
+                    gm = savedGM;
+                    s_task_faces += 2;
+                }
+            }
+            (*dl)++;  // 16-byte command: skip the extra 8 bytes like op_consume16
+        }
+
         // raw UV * 16.16 scale -> S10.5, as the ucode's vmudn/vmadh pair (result clamped to int16).
         static inline int16_t f5_tc_apply(int16_t raw, int32_t scale) {
             const int64_t v = ((int64_t)raw * (int64_t)scale) >> 16;
@@ -677,7 +987,18 @@ namespace RT64 {
             // word 2 = per-vertex byte offsets into the op_02 color buffer (v0..v3 in bytes 1,2,3,0)
             const uint32_t cofs[4] = { (colorWord >> 16) & 0xFF, (colorWord >> 8) & 0xFF, colorWord & 0xFF, colorWord >> 24 };
             for (int k = 0; k < n; ++k) {
-                if (idx[k] >= F5_FACE_SLOT || idx[k] >= s_cache_count) return;   // garbage / stale index
+                if (idx[k] >= F5_FACE_SLOT || idx[k] >= s_cache_count) {
+                    // ROGUESQ_FX_PROBE: count faces dropped by the index guard. If the animated
+                    // billboards are dropped here, they never reach the draw (or the force-show path).
+                    static bool s_fxr = env_on("ROGUESQ_FX_PROBE", false);
+                    if (s_fxr) {
+                        static uint32_t s_rej = 0, s_rejTex = 0; ++s_rej; if (st) ++s_rejTex;
+                        if ((s_rej % 200) == 1 || s_rej <= 20)
+                            std::fprintf(stderr, "[fx-reject] #%u (tex=%u) idx[%d]=%u cacheCount=%u n=%d tex=%06X\n",
+                                s_rej, s_rejTex, k, idx[k], s_cache_count, n, state->rdp->texture.address & 0x00FFFFFFu);
+                    }
+                    return;   // garbage / stale index
+                }
                 tmp[k] = state->rsp->vertices[idx[k]];
                 if (haveColors) {
                     const uint32_t c = rd_be_u32(state->RDRAM, cbuf + cofs[k]);
@@ -717,6 +1038,44 @@ namespace RT64 {
             }
             // Copy cycle type + triangles is undefined on hardware (RT64 asserts): a stale-walk symptom, skip the face.
             if (state->rdp->otherMode.cycleType() == G_CYC_COPY) { ++s_task_faces; return; }
+            // ROGUESQ_FX_PROBE: the animated explosion/smoke/fire flipbook is RGBA32 (fmt0/siz3).
+            // Log distinct (tex,comb,other) tuples + a running drawn count so the real effect
+            // sprites self-identify regardless of RDRAM address, and we see their exact alpha state.
+            {
+                static bool s_fx = env_on("ROGUESQ_FX_PROBE", false);
+                if (s_fx) {
+                    const LoadTile& T = state->rdp->tiles[0];
+                    if (st != nullptr) {  // census ALL textured quad types (dedup by fmt/siz/comb)
+                        static uint32_t s_drawn = 0; ++s_drawn;
+                        const auto& prim = state->rdp->primColorStack[state->rdp->primColorStackSize - 1];
+                        const auto& comb = state->rdp->colorCombinerStack[state->rdp->colorCombinerStackSize - 1];
+                        static std::unordered_set<uint64_t> s_seen;
+                        uint64_t key = ((uint64_t)T.fmt << 60) ^ ((uint64_t)T.siz << 56)
+                                     ^ ((uint64_t)comb.L << 4) ^ ((uint64_t)state->rdp->otherMode.L << 24);
+                        if (s_seen.size() < 80 && s_seen.insert(key).second) {
+                            // Source RGBA32 alpha survey: is the fire texture's alpha nonzero at
+                            // its RDRAM source? If yes but sprite invisible => RT64 drops siz3 alpha.
+                            const uint32_t tsrc = state->rdp->texture.address & 0x00FFFFFFu;
+                            int nzA = 0, maxA = 0; uint8_t a0px[4] = {0,0,0,0};
+                            for (int i = 0; i < 256; ++i) {
+                                uint8_t a = state->RDRAM[(tsrc + (uint32_t)i * 4 + 3) ^ 3];
+                                if (a) ++nzA; if (a > maxA) maxA = a;
+                            }
+                            for (int i = 0; i < 4; ++i) a0px[i] = state->RDRAM[(tsrc + i) ^ 3];
+                            std::fprintf(stderr,
+                                "[fx-face] #%u tex=%06X fmt=%u siz=%u texel0=(%u,%u,%u,%u) srcNZalpha=%d/256 maxA=%d n=%d cimg=%06X shade0=(%u,%u,%u,%u) haveCol=%d cbuf=%08X prim=(%.2f %.2f %.2f %.2f) combL=%08X combH=%08X otherL=%08X otherH=%08X cyc=%u filt=%u\n",
+                                s_drawn, tsrc, T.fmt, T.siz, a0px[0], a0px[1], a0px[2], a0px[3], nzA, maxA, n,
+                                state->rdp->colorImage.address & 0x00FFFFFFu,
+                                tmp[0].color.r, tmp[0].color.g, tmp[0].color.b, tmp[0].color.a,
+                                haveColors ? 1 : 0, cbuf,
+                                (float)prim.x, (float)prim.y, (float)prim.z, (float)prim.w,
+                                comb.L, comb.H, state->rdp->otherMode.L, state->rdp->otherMode.H,
+                                state->rdp->otherMode.cycleType(), state->rdp->otherMode.textFilt());
+                            std::fflush(stderr);
+                        }
+                    }
+                }
+            }
             // DIAG (ROGUESQ_LOG_GBI): the filter/cycle a MODEL face actually draws with. Point vs bilerp
             // decides whether models are blocky (point) or smooth. Bounded to the first few faces.
             { static int s_ff = 0; if (gbi_log_enabled() && ++s_ff <= 8) {
@@ -871,7 +1230,7 @@ namespace RT64 {
                 static bool s_bdbe = env_on("ROGUESQ_F5_BDBE", true);
                 static bool s_be16 = env_on("ROGUESQ_F5_BE16", true);
                 if (s_bdbe) {
-                    gbi->map[0xBD] = s_be16 ? &op_consume16 : &op_noop;
+                    gbi->map[0xBD] = s_be16 ? &op_bd_sprite : &op_noop;   // sprite emit (self-gated ROGUESQ_F5_SPRITES)
                     gbi->map[0xBE] = s_be16 ? &op_consume16 : &op_noop;
                 }
             }
@@ -896,4 +1255,12 @@ namespace RT64 {
             f5_install_bounded(gbi, std::make_integer_sequence<int, UCODE_MAP_SIZE>{});
         }
     }
+}
+
+// Called per object by a game-side hook on traverseSceneGraphRecursive's matrix-write site
+// (before_vram 0x800155e4): ringDst = a0 (the matrix output cursor MEM_W[0x8011DC5C]),
+// nodeId = the scene node pointer (register s2). Feeds op_01_matrix's ROGUESQ_F5_NODE_ID lookup.
+// Safe no-op until that hook exists; the lookup falls back to G_EX_ID_AUTO when the map is empty.
+extern "C" void rs64_f5_map_node(uint32_t ringDst, uint32_t nodeId) {
+    RT64::GBI_F3DFACTOR5::f5_map_node_impl(ringDst, nodeId);
 }

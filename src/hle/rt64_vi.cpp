@@ -4,6 +4,8 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cstdlib>
+#include <cstring>
 #include <memory.h>
 #include <stdio.h>
 
@@ -162,13 +164,24 @@ namespace RT64 {
     }
 
     uint32_t VIHistory::logicalRateFromFactors() {
-        if ((factors[0] != 0) && std::all_of(factors.begin(), factors.end(), [&](uint32_t factor) { return factor == factors[0]; })) {
-            const uint32_t FullRate = 60; // TODO: PAL support.
-            return FullRate / factors[0];
-        }
-        else {
+        const uint32_t FullRate = 60; // TODO: PAL support.
+        // ROGUESQ_INTERP_RATE=strict restores the stock all-equal rule; default is a majority vote
+        // over the 3-entry factor ring so a single load-spiked frame (busy scenes: explosions,
+        // fast flight) doesn't drop interpolation for the whole ring and lurch the frame.
+        static const int s_strict = [](){ const char *e = std::getenv("ROGUESQ_INTERP_RATE"); return (e && std::strcmp(e, "strict") == 0) ? 1 : 0; }();
+        if (s_strict) {
+            if ((factors[0] != 0) && std::all_of(factors.begin(), factors.end(), [&](uint32_t factor) { return factor == factors[0]; })) {
+                return FullRate / factors[0];
+            }
             return 0;
         }
+        uint32_t best = 0, bestCount = 0;
+        for (uint32_t f : factors) {
+            if (f == 0) continue;
+            uint32_t n = uint32_t(std::count(factors.begin(), factors.end(), f));
+            if (n > bestCount) { bestCount = n; best = f; }
+        }
+        return (best != 0 && bestCount * 2 > factors.size()) ? FullRate / best : 0;
     }
 
     const VIHistory::Present &VIHistory::top() const {

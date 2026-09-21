@@ -544,11 +544,50 @@ namespace RT64 {
                     const int32_t s  = (*dl)[1].p0(16, 16), t = (*dl)[1].p0(0, 16);
                     const int32_t ds = (*dl)[1].p1(16, 16), dtv = (*dl)[1].p1(0, 16);
                     const auto& T = state->rdp->tiles[rtile];
-                    std::fprintf(stderr, "[measure-fb] FLIPBOOK texrect tex=0x%06X cimg=0x%06X px=(%d,%d %dx%d) tile=%u st=(%d,%d) dsdt=(%d,%d) | tileFmt=%u siz=%u line=%u th=%u tw=%u\n",
+                    const auto& prim = state->rdp->primColorStack[state->rdp->primColorStackSize - 1];
+                    const auto& env  = state->rdp->envColorStack[state->rdp->envColorStackSize - 1];
+                    const auto& comb = state->rdp->colorCombinerStack[state->rdp->colorCombinerStackSize - 1];
+                    std::fprintf(stderr, "[measure-fb] FLIPBOOK texrect tex=0x%06X cimg=0x%06X px=(%d,%d %dx%d) tile=%u st=(%d,%d) dsdt=(%d,%d) | tileFmt=%u siz=%u line=%u th=%u tw=%u | prim=(%.2f %.2f %.2f %.2f) env=(%.2f %.2f %.2f %.2f) combL=0x%08X combH=0x%08X otherL=0x%08X\n",
                         tsrc, state->rdp->colorImage.address & 0x00FFFFFFu,
                         ulx >> 2, uly >> 2, (lrx - ulx) >> 2, (lry - uly) >> 2,
-                        rtile, s, t, ds, dtv, T.fmt, T.siz, T.line, T.uls, T.lrs);
+                        rtile, s, t, ds, dtv, T.fmt, T.siz, T.line, T.uls, T.lrs,
+                        (float)prim.x, (float)prim.y, (float)prim.z, (float)prim.w,
+                        (float)env.x, (float)env.y, (float)env.z, (float)env.w,
+                        comb.L, comb.H, state->rdp->otherMode.L);
                     std::fflush(stderr);
+                }
+            }
+            // ROGUESQ_FX_PROBE: RGBA32 (fmt0/siz3) effect texrects — the animated sprite
+            // billboards if they take the texrect path. Format-keyed, address-independent.
+            {
+                static int s_fxt = -1;
+                if (s_fxt < 0) { const char* v = std::getenv("ROGUESQ_FX_PROBE"); s_fxt = (v && *v && v[0] != '0') ? 0 : -2; }
+                if (s_fxt >= 0) {
+                    const uint8_t rtile = (*dl)[0].p1(24, 3);
+                    const auto& T = state->rdp->tiles[rtile];
+                    {
+                        static uint32_t s_dt = 0; ++s_dt;
+                        const auto& prim = state->rdp->primColorStack[state->rdp->primColorStackSize - 1];
+                        const auto& comb = state->rdp->colorCombinerStack[state->rdp->colorCombinerStackSize - 1];
+                        // Census of texrect TYPES: dedup by (fmt,siz,comb,otherL) so each kind of
+                        // texrect prints once. The animated billboard sprites are whichever small
+                        // rects flipbook their source texture; identify by fmt/siz + on-screen size.
+                        static std::unordered_set<uint64_t> s_seent;
+                        uint64_t key = ((uint64_t)T.fmt << 60) ^ ((uint64_t)T.siz << 56)
+                                     ^ ((uint64_t)comb.L << 4) ^ ((uint64_t)state->rdp->otherMode.L << 24);
+                        if (s_seent.size() < 80 && s_seent.insert(key).second) {
+                            const int32_t ulx = (*dl)[0].p1(12, 12), uly = (*dl)[0].p1(0, 12);
+                            const int32_t lrx = (*dl)[0].p0(12, 12), lry = (*dl)[0].p0(0, 12);
+                            std::fprintf(stderr,
+                                "[fx-rect] #%u tex=%06X fmt=%u siz=%u cimg=%06X px=(%d,%d %dx%d) prim=(%.2f %.2f %.2f %.2f) combL=%08X combH=%08X otherL=%08X otherH=%08X\n",
+                                s_dt, state->rdp->texture.address & 0x00FFFFFFu, T.fmt, T.siz,
+                                state->rdp->colorImage.address & 0x00FFFFFFu,
+                                ulx >> 2, uly >> 2, (lrx - ulx) >> 2, (lry - uly) >> 2,
+                                (float)prim.x, (float)prim.y, (float)prim.z, (float)prim.w,
+                                comb.L, comb.H, state->rdp->otherMode.L, state->rdp->otherMode.H);
+                            std::fflush(stderr);
+                        }
+                    }
                 }
             }
             // ROGUESQ_DECODE_PPM=1: manually decode the flipbook CI4 (source bytes +
@@ -901,6 +940,25 @@ namespace RT64 {
                     "[gbi-f5] loadBlock #%d tile=%u uls=%u ult=%u lrs=%u dxt=%u\n",
                     s_count, tile, uls, ult, lrs, dxt);
                 std::fflush(stderr);
+            }
+            // ROGUESQ_FX_PROBE: for the RGBA32 effect-sprite textures, log the image siz/fmt
+            // (SETTIMG) vs the LOAD-tile siz/fmt. loadBlockOperation only splits into both TMEM
+            // banks when the LOAD tile is siz3/fmt0; a 16b load idiom leaves the alpha bank empty.
+            {
+                static int s_fxl = -1;
+                if (s_fxl < 0) { const char* v = std::getenv("ROGUESQ_FX_PROBE"); s_fxl = (v && *v && v[0] != '0') ? 0 : -2; }
+                const uint32_t srcFx = state->rdp->texture.address & 0x00FFFFFFu;
+                const bool rgbaImg = (state->rdp->texture.siz == 3 && state->rdp->texture.fmt == 0);
+                if (s_fxl >= 0 && s_fxl < 24 && (rgbaImg || (srcFx >= 0x550000u && srcFx < 0x560000u))) {
+                    ++s_fxl;
+                    const LoadTile &lt = state->rdp->tiles[tile];
+                    std::fprintf(stderr,
+                        "[fx-load] src=0x%06X imgFmt=%u imgSiz=%u | loadtile[tile=%u fmt=%u siz=%u line=%u tmem=%u] uls=%u lrs=%u dxt=%u words=%d rgba32split=%d\n",
+                        srcFx, state->rdp->texture.fmt, state->rdp->texture.siz,
+                        tile, lt.fmt, lt.siz, lt.line, lt.tmem, uls, lrs, dxt, (int)(lrs - uls) + 1,
+                        (lt.siz == 3 && lt.fmt == 0) ? 1 : 0);
+                    std::fflush(stderr);
+                }
             }
             // ROGUESQ_DUMP_TEX=1: when a CI4 flipbook frame loads, dump the SOURCE
             // bytes from RDRAM (texture.address) to measure whether the streamed
