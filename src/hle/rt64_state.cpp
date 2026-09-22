@@ -13,6 +13,7 @@
 #include "imgui/imgui.h"
 #include "implot/implot.h"
 
+#include "common/rt64_diag_bounds.h"
 #include "common/rt64_elapsed_timer.h"
 #include "common/rt64_math.h"
 #include "common/rt64_tmem_hasher.h"
@@ -758,12 +759,14 @@ namespace RT64 {
                     if (s_rd < 0) { const char *e = std::getenv("ROGUESQ_REINT_DIAG"); s_rd = (e && e[0] && e[0] != '0') ? 1 : 0; }
                     if (s_rd) {
                         static uint64_t hits = 0, misses = 0;
-                        static std::unordered_set<uint64_t> distinctSrc, distinctHash;
+                        // Recent-window distinct counts (bounded, keep-recent) so a long
+                        // REINT_DIAG session can't accumulate one hash entry per tile forever.
+                        static rt64diag::BoundedSet<uint64_t> distinctSrc, distinctHash;
                         if (it != framebufferManager.reinterpretTileCache.end()) ++hits; else ++misses;
                         distinctSrc.insert(hashData.tmemHashOrID);
                         distinctHash.insert(reinterpretHash);
                         if (((hits + misses) & 8191) == 0)
-                            fprintf(stderr, "[reint] hits=%llu misses=%llu distinctSrc=%zu distinctHash=%zu\n",
+                            fprintf(stderr, "[reint] hits=%llu misses=%llu distinctSrc(win)=%zu distinctHash(win)=%zu\n",
                                     (unsigned long long)hits, (unsigned long long)misses, distinctSrc.size(), distinctHash.size());
                     }
                 }

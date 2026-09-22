@@ -23,6 +23,8 @@
 #include "rt64_gbi_f3d.h"
 #include "rt64_gbi_rdp.h"
 
+#include "common/rt64_diag_bounds.h"
+
 extern "C" void rt64_f5_desync_dump(const char *why, uint32_t badW1);
 
 #include <cstdio>
@@ -252,10 +254,10 @@ namespace RT64 {
             // First 8 calls also get logged unconditionally so we can see
             // chronology. ROGUESQ_LOG_GBI=1 enables.
             if (gbi_log_enabled()) {
-                static std::unordered_set<uint64_t> s_seen;
+                static rt64diag::BoundedSet<uint64_t> s_seen;
                 static int s_count = 0;
                 const uint64_t key = (uint64_t((*dl)->w0) << 32) | uint64_t((*dl)->w1);
-                const bool firstSeen = s_seen.insert(key).second;
+                const bool firstSeen = s_seen.insert(key);
                 if (++s_count <= 8 || firstSeen) {
                     std::fprintf(stderr,
                         "[gbi-f5] setCombine #%d%s w0=0x%08X w1=0x%08X\n",
@@ -645,7 +647,7 @@ namespace RT64 {
             // Track per-active-CIMG-address texrect counts to see which fbs
             // actually receive draws. ROGUESQ_LOG_CIMG=1 enables.
             {
-                static std::unordered_map<uint32_t, uint32_t> s_drawsPerFb;
+                static rt64diag::BoundedMap<uint32_t, uint32_t> s_drawsPerFb;
                 static int s_total = 0;
                 static bool s_log = []() {
                     const char* v = std::getenv("ROGUESQ_LOG_CIMG");
@@ -669,10 +671,10 @@ namespace RT64 {
             if (gbi_log_enabled()) {
                 struct Key { uint32_t fb, l, h; bool operator==(const Key& o) const { return fb==o.fb && l==o.l && h==o.h; } };
                 struct KeyHash { size_t operator()(const Key& k) const { return std::hash<uint64_t>()((uint64_t(k.fb) << 32) ^ (uint64_t(k.l) << 16) ^ uint64_t(k.h)); } };
-                static std::unordered_set<Key, KeyHash> s_seen;
+                static rt64diag::BoundedSet<Key, KeyHash> s_seen;
                 const auto& comb = state->rdp->colorCombinerStack[state->rdp->colorCombinerStackSize - 1];
                 Key k{state->rdp->colorImage.address, comb.L, comb.H};
-                if (s_seen.insert(k).second) {
+                if (s_seen.insert(k)) {
                     std::fprintf(stderr,
                         "[gbi-f5] texrect-uses fb=0x%06X combL=0x%08X combH=0x%08X otherL=0x%08X\n",
                         k.fb, k.l, k.h, state->rdp->otherMode.L);
@@ -1166,7 +1168,7 @@ namespace RT64 {
             // Track distinct SETTIMG source addresses to find missing fb-as-
             // texture composite ops (e.g. hi-res scratch → lo-res VI fb).
             if (gbi_log_enabled()) {
-                static std::unordered_map<uint32_t, uint32_t> s_seen;
+                static rt64diag::BoundedMap<uint32_t, uint32_t> s_seen;
                 const uint32_t count = ++s_seen[w1];
                 if (count == 1 || count == 8 || (count & 0xFF) == 0) {
                     std::fprintf(stderr,
@@ -1329,7 +1331,7 @@ namespace RT64 {
             // setCIMG'd at all (presence) and how often vs. scratch fbs
             // (frequency). ROGUESQ_LOG_CIMG=1 to enable.
             {
-                static std::unordered_map<uint32_t, uint32_t> s_counts;
+                static rt64diag::BoundedMap<uint32_t, uint32_t> s_counts;
                 static int s_total = 0;
                 static bool s_log = []() {
                     const char* v = std::getenv("ROGUESQ_LOG_CIMG");
@@ -1432,12 +1434,12 @@ namespace RT64 {
                 if (s_log) {
                     const uint32_t addr = state->rdp->colorImage.address;
                     if (addr == 0x62B800 || addr == 0x695C00 || addr == 0x795C00) {
-                        static std::unordered_map<uint64_t, uint32_t> s_seenDims;
+                        static rt64diag::BoundedSet<uint64_t> s_seenDims;
                         uint64_t key = (uint64_t(addr) << 32) |
                                        (uint64_t(state->rdp->colorImage.width) << 16) |
                                        (uint64_t(state->rdp->colorImage.fmt) << 8) |
                                        uint64_t(state->rdp->colorImage.siz);
-                        if (s_seenDims.insert({key, 1}).second) {
+                        if (s_seenDims.insert(key)) {
                             std::fprintf(stderr,
                                 "[gbi-f5] visFb-CIMG addr=0x%06X width=%u fmt=%u siz=%u\n",
                                 addr, state->rdp->colorImage.width,

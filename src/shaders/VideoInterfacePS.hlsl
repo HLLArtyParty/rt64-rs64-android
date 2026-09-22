@@ -13,8 +13,15 @@ SamplerState gSampler : register(s2);
 float4 SampleInput(float2 uv) {
     const float2 LowerRight = gConstants.videoResolution / gConstants.textureResolution;
     const float2 HalfPixel = float2(0.5f, 0.5f) / gConstants.textureResolution;
+    // Overscan inset: pull the far edge in so sampling never reaches the render target's stale
+    // outermost column (pooled/reused targets keep prior-frame pixels there -> saturated flicker
+    // on dark full-frame screens). The outer strip smears the last valid texel instead of the
+    // stale one; it is not blacked, since outsideBorder still keys off the true LowerRight.
+    const float2 Inset = max(HalfPixel, gConstants.overscan / gConstants.textureResolution);
+    const float2 LoBound = HalfPixel;
+    const float2 HiBound = LowerRight - Inset;
     float2 outsideBorder = step(LowerRight, uv);
-    float2 cuv = clamp(uv, HalfPixel, LowerRight - HalfPixel);
+    float2 cuv = clamp(uv, LoBound, HiBound);
     float4 sampledColor;
     // N64 VI-style soften: when viFilter > 0, average a plus-shaped tent around the sample point at a
     // color-target-texel radius. Approximates the console VI's de-dither/AA blur that softens surfaces
@@ -22,10 +29,10 @@ float4 SampleInput(float2 uv) {
     if (gConstants.viFilter > 0.0f) {
         float2 t = gConstants.viFilter / gConstants.textureResolution;
         float4 acc = gInput.SampleLevel(gSampler, cuv, 0) * 4.0f;
-        acc += gInput.SampleLevel(gSampler, clamp(cuv + float2(t.x, 0.0f), HalfPixel, LowerRight - HalfPixel), 0) * 2.0f;
-        acc += gInput.SampleLevel(gSampler, clamp(cuv - float2(t.x, 0.0f), HalfPixel, LowerRight - HalfPixel), 0) * 2.0f;
-        acc += gInput.SampleLevel(gSampler, clamp(cuv + float2(0.0f, t.y), HalfPixel, LowerRight - HalfPixel), 0) * 2.0f;
-        acc += gInput.SampleLevel(gSampler, clamp(cuv - float2(0.0f, t.y), HalfPixel, LowerRight - HalfPixel), 0) * 2.0f;
+        acc += gInput.SampleLevel(gSampler, clamp(cuv + float2(t.x, 0.0f), LoBound, HiBound), 0) * 2.0f;
+        acc += gInput.SampleLevel(gSampler, clamp(cuv - float2(t.x, 0.0f), LoBound, HiBound), 0) * 2.0f;
+        acc += gInput.SampleLevel(gSampler, clamp(cuv + float2(0.0f, t.y), LoBound, HiBound), 0) * 2.0f;
+        acc += gInput.SampleLevel(gSampler, clamp(cuv - float2(0.0f, t.y), LoBound, HiBound), 0) * 2.0f;
         sampledColor = acc / 12.0f;
     } else {
         sampledColor = gInput.SampleLevel(gSampler, cuv, 0);

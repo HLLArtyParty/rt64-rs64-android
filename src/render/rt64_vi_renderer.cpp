@@ -94,11 +94,26 @@ namespace RT64 {
             return (v && *v) ? float(std::atof(v)) : 0.0f;
         }();
 
+        // ROGUESQ_VI_OVERSCAN=<native pixels>: pull the right edge of the sampled region in by this
+        // many native pixels so the composite never samples the render target's stale outermost
+        // column (pooled targets keep prior-frame pixels there -> flickering saturated sliver on
+        // dark full-frame screens). Default 1; 0 disables (A/B against the raw edge).
+        static const float s_overscan = []() {
+            const char *v = std::getenv("ROGUESQ_VI_OVERSCAN");
+            return (v && *v) ? float(std::atof(v)) : 1.0f;
+        }();
+
+        const hlslpp::uint2 nativeSize = p.vi->fbSize();
         interop::VideoInterfaceCB pushConstants;
-        pushConstants.videoResolution = computeHDSize(hlslpp::float2(p.vi->fbSize()), p.resolutionScale, p.downsamplingScale);
+        pushConstants.videoResolution = computeHDSize(hlslpp::float2(nativeSize), p.resolutionScale, p.downsamplingScale);
         pushConstants.textureResolution = { float(p.textureWidth), float(p.textureHeight) };
         pushConstants.gamma = (s_gamma > 0.0f) ? s_gamma : p.vi->gamma();
         pushConstants.viFilter = s_viFilter;
+        // Inset = (overscan native columns) * texels-per-native + half a texel. The +0.5 guard makes
+        // the linear tap land on the last texel of the KEPT region instead of blending back into the
+        // stale outer column (a plain 1-native-px inset still bleeds ~half the garbage through).
+        const float texelsPerNativeX = (nativeSize.x > 0) ? (float(p.textureWidth) / float(nativeSize.x)) : 0.0f;
+        pushConstants.overscan = { (s_overscan > 0.0f) ? (s_overscan * texelsPerNativeX + 0.5f) : 0.0f, 0.0f };
 
         p.commandList->setPipeline(shader->pipeline.get());
         p.commandList->setGraphicsPipelineLayout(shader->pipelineLayout.get());
