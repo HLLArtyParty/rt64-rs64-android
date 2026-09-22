@@ -703,7 +703,7 @@ namespace RT64 {
             ext.workloadGraphicsWorker->commandList->writeTimestamp(queryPool.get(), 0);
             framebufferRenderer->endFramebuffers(ext.workloadGraphicsWorker, &workload.drawBuffers, &workload.outputBuffers, workloadConfig.raytracingEnabled);
             framebufferRenderer->recordSetup(ext.workloadGraphicsWorker, bufferUploaders, processRSP ? rspProcessor.get() : nullptr, processWorldVertices ? vertexProcessor.get() : nullptr, &workload.outputBuffers, workloadConfig.raytracingEnabled);
-            
+
             // Record all framebuffer pairs.
             uint32_t framebufferIndex = 0;
             for (uint32_t f = 0; f < fbPairCount; f++) {

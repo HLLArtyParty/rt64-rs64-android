@@ -46,8 +46,9 @@ float sampleBackgroundDepth(int2 pixelPos, uint sampleCount) {
 #endif
 
 LIBRARY_EXPORT bool RasterPS(const RenderParams rp, float4 vertexPosition, float2 vertexUV, float4 vertexSmoothColor, float4 vertexFlatColor,
-    bool isFrontFace, out float4 resultColor, out float4 resultAlpha) 
+    uint iRenderIndex, bool isFrontFace, out float4 resultColor, out float4 resultAlpha)
 {
+    const uint renderIndex = gConstants.useVertexRenderIndex ? iRenderIndex : gConstants.renderIndex;
     const OtherMode otherMode = { rp.omL, rp.omH };
 #if defined(DYNAMIC_RENDER_PARAMS)
     if ((otherMode.cycleType() != G_CYC_COPY) && renderFlagCulling(rp.flags) && isFrontFace) {
@@ -55,7 +56,7 @@ LIBRARY_EXPORT bool RasterPS(const RenderParams rp, float4 vertexPosition, float
     }
 #endif
     
-    const uint instanceIndex = instanceRenderIndices[gConstants.renderIndex].instanceIndex;
+    const uint instanceIndex = instanceRenderIndices[renderIndex].instanceIndex;
     const float4 vertexColor = renderFlagSmoothShade(rp.flags) ? vertexSmoothColor : float4(vertexFlatColor.rgb, vertexSmoothColor.a);
     const ColorCombiner colorCombiner = { rp.ccL, rp.ccH };
     const bool depthClampNear = renderFlagNoN(rp.flags);
@@ -120,12 +121,12 @@ LIBRARY_EXPORT bool RasterPS(const RenderParams rp, float4 vertexPosition, float
         lodScale = FbParams.resolutionScale.y;
     }
     
-    computeLOD(otherMode, instanceRenderIndices[gConstants.renderIndex].rdpTileCount, instanceRDPParams[instanceIndex].primLOD, lodScale, ddxuvx, ddyuvy, tileIndex0, tileIndex1, lodFraction);
+    computeLOD(otherMode, instanceRenderIndices[renderIndex].rdpTileCount, instanceRDPParams[instanceIndex].primLOD, lodScale, ddxuvx, ddyuvy, tileIndex0, tileIndex1, lodFraction);
 
     float4 texVal0 = float4(0.0f, 0.0f, 0.0f, 1.0f);
     float4 texVal1 = float4(0.0f, 0.0f, 0.0f, 1.0f);
     if (renderFlagUsesTexture0(rp.flags)) {
-        const uint globalTileIndex = instanceRenderIndices[gConstants.renderIndex].rdpTileIndex + tileIndex0;
+        const uint globalTileIndex = instanceRenderIndices[renderIndex].rdpTileIndex + tileIndex0;
         RDPTile rdpTile = RDPTiles[globalTileIndex];
         if (!renderFlagDynamicTiles(rp.flags)) {
             rdpTile.cms = renderCMS0(rp.flags);
@@ -140,7 +141,7 @@ LIBRARY_EXPORT bool RasterPS(const RenderParams rp, float4 vertexPosition, float
     
     if (renderFlagUsesTexture1(rp.flags)) {
         const bool oneCycleHardwareBug = (otherMode.cycleType() == G_CYC_1CYCLE);
-        const uint globalTileIndex = instanceRenderIndices[gConstants.renderIndex].rdpTileIndex + (oneCycleHardwareBug ? tileIndex0 : tileIndex1);
+        const uint globalTileIndex = instanceRenderIndices[renderIndex].rdpTileIndex + (oneCycleHardwareBug ? tileIndex0 : tileIndex1);
         RDPTile rdpTile = RDPTiles[globalTileIndex];
         if (!renderFlagDynamicTiles(rp.flags)) {
             rdpTile.cms = oneCycleHardwareBug ? renderCMS0(rp.flags) : renderCMS1(rp.flags);
@@ -247,7 +248,7 @@ LIBRARY_EXPORT bool RasterPS(const RenderParams rp, float4 vertexPosition, float
     }
     
     // Add highlight color to the last step.
-    uint highlightColorUint = instanceRenderIndices[gConstants.renderIndex].highlightColor;
+    uint highlightColorUint = instanceRenderIndices[renderIndex].highlightColor;
     if (highlightColorUint > 0) {
         float4 highlightColor = RGBA32ToFloat4(highlightColorUint);
         resultColor = lerp(resultColor, highlightColor, highlightColor.a);
@@ -263,8 +264,8 @@ LIBRARY_EXPORT bool RasterPS(const RenderParams rp, float4 vertexPosition, float
 }
 
 #if defined(DYNAMIC_RENDER_PARAMS)
-RenderParams getRenderParams() {
-    uint instanceIndex = instanceRenderIndices[gConstants.renderIndex].instanceIndex;
+RenderParams getRenderParams(uint renderIndex) {
+    uint instanceIndex = instanceRenderIndices[renderIndex].instanceIndex;
     return DynamicRenderParams[instanceIndex];
 }
 #elif defined(SPEC_CONSTANT_RENDER_PARAMS)
@@ -276,6 +277,7 @@ void PSMain(
       in float4 vertexPosition : SV_POSITION
     , in float2 vertexUV : TEXCOORD
     , in float4 vertexSmoothColor : COLOR0
+    , nointerpolation in uint iRenderIndex : RIDX
 #if defined(DYNAMIC_RENDER_PARAMS) || defined(VERTEX_FLAT_COLOR)
     , nointerpolation in float4 vertexFlatColor : COLOR1
 #endif
@@ -295,7 +297,13 @@ void PSMain(
     float4 resultColor;
     float4 resultAlpha;
     float resultDepth;
-    if (!RasterPS(getRenderParams(), vertexPosition, vertexUV, vertexSmoothColor, vertexFlatColor, isFrontFace, resultColor, resultAlpha)) {
+#if defined(DYNAMIC_RENDER_PARAMS)
+    const uint renderIndex = gConstants.useVertexRenderIndex ? iRenderIndex : gConstants.renderIndex;
+    const RenderParams rp = getRenderParams(renderIndex);
+#else
+    const RenderParams rp = getRenderParams();
+#endif
+    if (!RasterPS(rp, vertexPosition, vertexUV, vertexSmoothColor, vertexFlatColor, iRenderIndex, isFrontFace, resultColor, resultAlpha)) {
         discard;
     }
 

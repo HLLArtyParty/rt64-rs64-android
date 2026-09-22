@@ -69,17 +69,24 @@ namespace RT64 {
         std::vector<InstanceDrawCall> instanceDrawCallVector;
         std::vector<RenderPipelineProgram> hitGroupVector;
         std::vector<interop::RenderIndices> renderIndicesVector;
+        // Per-vertex renderIndex (draw-coalescing): one entry per global vertex,
+        // = the renderIndex of the object owning that vertex. Uploaded as vertex
+        // stream 3 so a merged draw can span multiple objects. See s_ri_collisions.
+        std::vector<uint32_t> renderIndexData;      // indexed-triangle vertices
+        std::vector<uint32_t> rawRenderIndexData;   // raw/rect vertices
         std::vector<DynamicTextureView> dynamicTextureViewVector;
         std::vector<RenderTextureBarrier> dynamicTextureBarrierVector;
         std::unique_ptr<BufferUploader> shaderUploader;
         std::vector<RSPSmoothNormalGenerationCB> rspSmoothNormalVector;
-        std::array<RenderInputSlot, 3> vertexInputSlots;
-        std::array<RenderVertexBufferView, 3> indexedVertexViews;
-        std::array<RenderVertexBufferView, 3> rawVertexViews;
+        std::array<RenderInputSlot, 4> vertexInputSlots;
+        std::array<RenderVertexBufferView, 4> indexedVertexViews;
+        std::array<RenderVertexBufferView, 4> rawVertexViews;
         RenderIndexBufferView indexBufferView;
         RenderBuffer *testZIndexBuffer = nullptr;
         RenderIndexBufferView testZIndexBufferView;
         BufferPair renderIndicesBuffer;
+        BufferPair renderIndexBuffer;       // upload of renderIndexData (vertex stream 3, indexed)
+        BufferPair rawRenderIndexBuffer;    // upload of rawRenderIndexData (vertex stream 3, raw)
         BufferPair interleavedRastersBuffer;
         uint32_t interleavedRastersCount = 0;
         BufferPair frameParamsBuffer;

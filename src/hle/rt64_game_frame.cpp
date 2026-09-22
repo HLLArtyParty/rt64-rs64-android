@@ -75,6 +75,21 @@ namespace RT64 {
         const Workload &cmpWorkload = workloadQueue.workloads[firstProj.workloadIndex];
         const FramebufferPair &cmpFbPair = cmpWorkload.fbPairs[firstProj.fbPairIndex];
         const Projection &cmpProj = cmpFbPair.projections[firstProj.projectionIndex];
+        // RogueSquadron64Recomp: a projection can carry a transformsIndex past its workload's
+        // viewTransforms (stale curViewProjIndex vs the per-workload transform reset) -- hit on the
+        // showroom/media menu. This runs on the render thread (outside the recomp SEH), so an OOB
+        // vector[] here aborts the whole process via the STL bounds-check int3. Treat as incompatible.
+        if (cmpProj.transformsIndex >= cmpWorkload.drawData.viewTransforms.size() ||
+            fbProj.transformsIndex >= workload.drawData.viewTransforms.size()) {
+            static int s_n = 0;
+            if (s_n++ < 8) {
+                fprintf(stderr, "[f5-scenecompat-guard] OOB transformsIndex cmp=%u/%zu fb=%u/%zu\n",
+                    cmpProj.transformsIndex, cmpWorkload.drawData.viewTransforms.size(),
+                    fbProj.transformsIndex, workload.drawData.viewTransforms.size());
+                fflush(stderr);
+            }
+            return false;
+        }
         const interop::float4x4 &cmpViewMatrix = cmpWorkload.drawData.viewTransforms[cmpProj.transformsIndex];
         const interop::float4x4 &fbViewMatrix = workload.drawData.viewTransforms[fbProj.transformsIndex];
         const float viewMatrixDiff = matrixDifference(cmpViewMatrix, fbViewMatrix);
@@ -126,6 +141,21 @@ namespace RT64 {
                 for (uint32_t p = 0; p < fbPair.projectionCount; p++) {
                     const GameIndices::Projection newProj = { w, f, p };
                     const auto &fbPairProj = fbPair.projections[p];
+                    // RogueSquadron64Recomp: a projection can carry a transformsIndex past this
+                    // workload's viewTransforms (stale curViewProjIndex vs the per-workload
+                    // transform reset -- hit on the showroom/media menu). Skip it here so it never
+                    // enters the scene structures; otherwise the render thread OOB-indexes
+                    // viewTransforms in isSceneCompatible/matchScenes and the STL bounds-check
+                    // int3 (outside the recomp SEH) kills the whole process.
+                    if (fbPairProj.transformsIndex >= workload.drawData.viewTransforms.size()) {
+                        static int s_n = 0;
+                        if (s_n++ < 8) {
+                            fprintf(stderr, "[f5-proj-guard] skip proj w=%u f=%u p=%u transformsIndex=%u >= viewTransforms=%zu\n",
+                                w, f, p, fbPairProj.transformsIndex, workload.drawData.viewTransforms.size());
+                            fflush(stderr);
+                        }
+                        continue;
+                    }
                     switch (fbPairProj.type) {
                     case Projection::Type::Perspective:
                         addProjection(workloadQueue, newProj, perspectiveScenes);

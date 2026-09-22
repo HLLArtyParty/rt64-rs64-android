@@ -827,7 +827,7 @@ namespace RT64 {
                             const int32_t ulx = (*dl)[0].p1(12,12)>>2, uly = (*dl)[0].p1(0,12)>>2;
                             const int32_t lrx = (*dl)[0].p0(12,12)>>2, lry = (*dl)[0].p0(0,12)>>2;
                             std::fprintf(stderr, "[texrect-probe] #%d dl#%u DREW medal tex=0x%06X -> cimg=0x%08X w=%u px=(%d,%d)-(%d,%d)\n",
-                                s_tn, state->displayListCounter, tsrc, state->rdp->colorImage.address, state->rdp->colorImage.width, ulx, uly, lrx, lry);
+                                s_tn, (unsigned)state->displayListCounter, tsrc, state->rdp->colorImage.address, state->rdp->colorImage.width, ulx, uly, lrx, lry);
                             std::fflush(stderr);
                         }
                     }

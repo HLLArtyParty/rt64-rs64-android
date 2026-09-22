@@ -11,7 +11,8 @@
 
 [[vk::push_constant]] ConstantBuffer<RasterParams> gConstants : register(b0, space0);
 
-LIBRARY_EXPORT void RasterVS(const RenderParams rp, in float4 iPosition, in float2 iUV, in float4 iColor, out float4 oPosition, out float2 oUV, out float4 oSmoothColor, out float4 oFlatColor) {
+LIBRARY_EXPORT void RasterVS(const RenderParams rp, in float4 iPosition, in float2 iUV, in float4 iColor, in uint iRenderIndex, out float4 oPosition, out float2 oUV, out float4 oSmoothColor, out float4 oFlatColor) {
+    const uint renderIndex = gConstants.useVertexRenderIndex ? iRenderIndex : gConstants.renderIndex;
     float4 ndcPos = iPosition;
     
     // Skip any sort of transformation on the coordinates when rendering rects.
@@ -29,7 +30,7 @@ LIBRARY_EXPORT void RasterVS(const RenderParams rp, in float4 iPosition, in floa
     const bool copyMode = (otherMode.cycleType() == G_CYC_COPY);
     const bool zSourcePrim = (otherMode.zSource() == G_ZS_PRIM);
     if (!copyMode && zSourcePrim) {
-        const uint instanceIndex = instanceRenderIndices[gConstants.renderIndex].instanceIndex;
+        const uint instanceIndex = instanceRenderIndices[renderIndex].instanceIndex;
         ndcPos.z = instanceRDPParams[instanceIndex].primDepth.x * ndcPos.w;
     }
 
@@ -40,8 +41,8 @@ LIBRARY_EXPORT void RasterVS(const RenderParams rp, in float4 iPosition, in floa
 }
 
 #if defined(DYNAMIC_RENDER_PARAMS)
-RenderParams getRenderParams() {
-    uint instanceIndex = instanceRenderIndices[gConstants.renderIndex].instanceIndex;
+RenderParams getRenderParams(uint renderIndex) {
+    uint instanceIndex = instanceRenderIndices[renderIndex].instanceIndex;
     return DynamicRenderParams[instanceIndex];
 }
 #elif defined(SPEC_CONSTANT_RENDER_PARAMS)
@@ -53,9 +54,11 @@ void VSMain(
     in float4 iPosition : POSITION
     , in float2 iUV : TEXCOORD
     , in float4 iColor : COLOR
+    , in uint iRenderIndex : RENDERINDEX
     , out float4 oPosition : SV_POSITION
     , out float2 oUV : TEXCOORD
     , out float4 oSmoothColor : COLOR0
+    , nointerpolation out uint oRenderIndex : RIDX
 #if defined(DYNAMIC_RENDER_PARAMS) || defined(VERTEX_FLAT_COLOR)
     , out float4 oFlatColor : COLOR1
 #endif
@@ -64,6 +67,12 @@ void VSMain(
 #if !defined(DYNAMIC_RENDER_PARAMS) && !defined(VERTEX_FLAT_COLOR)
     float4 oFlatColor;
 #endif
-    RasterVS(getRenderParams(), iPosition, iUV, iColor, oPosition, oUV, oSmoothColor, oFlatColor);
+    oRenderIndex = iRenderIndex; // raw per-vertex value; RasterVS/RasterPS apply the flag
+#if defined(DYNAMIC_RENDER_PARAMS)
+    const uint renderIndex = gConstants.useVertexRenderIndex ? iRenderIndex : gConstants.renderIndex;
+    RasterVS(getRenderParams(renderIndex), iPosition, iUV, iColor, iRenderIndex, oPosition, oUV, oSmoothColor, oFlatColor);
+#else
+    RasterVS(getRenderParams(), iPosition, iUV, iColor, iRenderIndex, oPosition, oUV, oSmoothColor, oFlatColor);
+#endif
 }
 #endif

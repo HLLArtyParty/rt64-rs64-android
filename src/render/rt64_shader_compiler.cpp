@@ -52,6 +52,7 @@ namespace RT64 {
             infoLog[error->GetBufferSize()] = 0;
 
             RT64_LOG_PRINTF("Shader compilation error: %s\n", infoLog.data());
+            fprintf(stderr, "[shader-error] %s\n", infoLog.data()); fflush(stderr);
             throw std::runtime_error("Shader compilation error: " + std::string(infoLog.data()));
         }
     }

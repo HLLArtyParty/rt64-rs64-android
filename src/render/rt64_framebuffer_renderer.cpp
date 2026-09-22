@@ -5,9 +5,11 @@
 #include "rt64_framebuffer_renderer.h"
 
 #include <atomic>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <unordered_set>
 
 #include "../include/rt64_extended_gbi.h"
 
@@ -55,8 +57,13 @@ namespace interop {
 };
 
 namespace RT64 {
+    // ROGUESQ_LOG_BATCH: per-vertex renderIndex stamp collisions (a vertex stamped
+    // with two different object indices). Order-safe coalescing assumes vertices are
+    // not shared across GameCalls; a nonzero total here would break that assumption.
+    static std::atomic<uint64_t> s_ri_collisions{0};
+
     // Helper functions.
-    
+
     RenderRect convertFixedRect(FixedRect rect, hlslpp::float2 resScale, int32_t fbWidth, float aspectRatioScale, float extOriginPercentage, int32_t horizontalMisalignment, uint16_t leftOrigin, uint16_t rightOrigin) {
         if (!rect.isNull()) {
             auto computeOrigin = [=](uint16_t origin) {
@@ -176,6 +183,8 @@ namespace RT64 {
         instanceDrawCallVector.clear();
         hitGroupVector.clear();
         renderIndicesVector.clear();
+        renderIndexData.clear();
+        rawRenderIndexData.clear();
         rspSmoothNormalVector.clear();
         frameParams.viewUbershaders = ubershadersVisible;
         frameParams.ditherNoiseStrength = ditherNoiseStrength;
@@ -505,6 +514,17 @@ namespace RT64 {
         RenderDescriptorSet *descRealFbSet = framebuffer.descRealFbSet->get();
         RenderDescriptorSet *descDummyFbSet = framebuffer.descDummyFbSet->get();
 
+        // ROGUESQ_LOG_BATCH — batching-headroom counters (summary emitted after
+        // the loop). Measures how many setPipeline/setScissor binds a perfect
+        // per-scene sort could remove (savable = sequential switches - distinct).
+        static const bool s_log_batch = []{
+            const char *e = std::getenv("ROGUESQ_LOG_BATCH");
+            return e && *e && *e != '0';
+        }();
+        uint32_t bDraws = 0, bPipeSw = 0, bScisSw = 0, bRuns = 0;
+        std::unordered_set<const void*> bDistinctPipe;
+        std::vector<RenderRect> bDistinctScis;
+
         auto switchToGraphicsPipeline = [&]() {
             previousCallType = InstanceDrawCall::Type::Unknown;
             previousVertexTestZ = false;
@@ -569,7 +589,9 @@ namespace RT64 {
             }
         }
 
-        for (uint32_t i : rasterScene.instanceIndices) {
+        ElapsedTimer batchTimer; // ROGUESQ_LOG_BATCH: submitRasterScene recording time
+        for (size_t sceneIdx = 0; sceneIdx < rasterScene.instanceIndices.size(); ++sceneIdx) {
+            const uint32_t i = rasterScene.instanceIndices[sceneIdx];
             const InstanceDrawCall &drawCall = instanceDrawCallVector[i];
 
             // ROGUESQ_LOG_PIPELINE (stage 2.6) — per-instance classification,
@@ -697,14 +719,82 @@ namespace RT64 {
                 if (previousScissor != triangles.scissor) {
                     worker->commandList->setScissors(triangles.scissor);
                     previousScissor = triangles.scissor;
+                    if (s_log_batch) ++bScisSw;
                 }
 
                 if (previousPipeline != triangles.pipeline) {
                     worker->commandList->setPipeline(triangles.pipeline);
                     previousPipeline = triangles.pipeline;
+                    if (s_log_batch) ++bPipeSw;
                 }
-                
+
+                if (s_log_batch) {
+                    ++bDraws;
+                    bDistinctPipe.insert(triangles.pipeline);
+                    bool seenScis = false;
+                    for (const RenderRect &r : bDistinctScis) {
+                        if (!(r != triangles.scissor)) { seenScis = true; break; }
+                    }
+                    if (!seenScis) bDistinctScis.push_back(triangles.scissor);
+                }
+
+                // Coalesce a run of consecutive IndexedTriangles that share pipeline /
+                // scissor / screen transform and have contiguous index ranges into a
+                // single draw. Order-safe: no reordering, and same pipeline => same
+                // depth/blend state (already bound above), so a merged run is exactly
+                // what the per-draw sequence would have rasterized. renderIndex comes
+                // from the per-vertex stream for the merged draw.
+                static const bool s_no_coalesce = [](){ const char* e = std::getenv("ROGUESQ_NO_COALESCE"); return e && *e && *e != '0'; }();
+                // Coalesce consecutive same-TYPE triangle draws (indexed, raw, or rect)
+                // sharing pipeline/scissor/screen transform with contiguous index (or raw
+                // vertex) ranges. Indexed -> drawIndexedInstanced, raw/rect -> drawInstanced;
+                // both source renderIndex per-vertex (their respective slot-3 stream).
+                const bool coalescable =
+                    drawCall.type == InstanceDrawCall::Type::IndexedTriangles ||
+                    drawCall.type == InstanceDrawCall::Type::RawTriangles ||
+                    drawCall.type == InstanceDrawCall::Type::RegularRect;
+                size_t runEnd = sceneIdx;
+                uint32_t runFaces = triangles.faceCount;
+                if (!s_no_coalesce && coalescable && !triangles.postBlendDitherNoise) {
+                    uint32_t nextIndex = triangles.indexStart + triangles.faceCount * 3;
+                    for (size_t j = sceneIdx + 1; j < rasterScene.instanceIndices.size(); ++j) {
+                        const InstanceDrawCall &d2 = instanceDrawCallVector[rasterScene.instanceIndices[j]];
+                        if (d2.type != drawCall.type) break;
+                        const auto &t2 = d2.triangles;
+                        if (t2.pipeline != triangles.pipeline) break;
+                        if (t2.vertexTestZ != triangles.vertexTestZ) break;
+                        if (t2.postBlendDitherNoise) break;
+                        if (t2.indexStart != nextIndex) break;
+                        if (t2.scissor.isEmpty()) break;
+                        if (t2.scissor != triangles.scissor) break;
+                        if (t2.screenScale.x != triangles.screenScale.x || t2.screenScale.y != triangles.screenScale.y) break;
+                        if (t2.screenOffset.x != triangles.screenOffset.x || t2.screenOffset.y != triangles.screenOffset.y) break;
+                        runFaces += t2.faceCount;
+                        nextIndex += t2.faceCount * 3;
+                        runEnd = j;
+                    }
+                }
+
+                if (runEnd > sceneIdx) {
+                    rasterParams.renderIndex = 0;
+                    rasterParams.useVertexRenderIndex = 1; // per-vertex renderIndex spans the merged objects
+                    rasterParams.screenScale = triangles.screenScale;
+                    rasterParams.screenOffset = triangles.screenOffset;
+                    worker->commandList->setGraphicsPushConstants(0, &rasterParams);
+                    if (drawCall.type == InstanceDrawCall::Type::IndexedTriangles) {
+                        worker->commandList->drawIndexedInstanced(runFaces * 3, 1, triangles.indexStart, 0, 0);
+                    }
+                    else {
+                        worker->commandList->drawInstanced(runFaces * 3, 1, triangles.indexStart, 0);
+                    }
+                    if (s_log_batch) { bDraws += uint32_t(runEnd - sceneIdx); ++bRuns; }
+                    sceneIdx = runEnd;
+                    break;
+                }
+
+                if (s_log_batch) ++bRuns;
                 rasterParams.renderIndex = i;
+                rasterParams.useVertexRenderIndex = 0; // single draw: per-draw push-constant path (identical to prior behavior)
                 rasterParams.screenScale = triangles.screenScale;
                 rasterParams.screenOffset = triangles.screenOffset;
                 worker->commandList->setGraphicsPushConstants(0, &rasterParams);
@@ -796,6 +886,21 @@ namespace RT64 {
             default:
                 // Do nothing.
                 break;
+            }
+        }
+
+        if (s_log_batch && bDraws >= 100) {
+            static std::atomic<int> s_bn{0};
+            int n = ++s_bn;
+            if (n <= 8 || (n % 20) == 0) {
+                const int dPipe = (int)bDistinctPipe.size();
+                const int dScis = (int)bDistinctScis.size();
+                std::fprintf(stderr,
+                    "[batch] draws=%u runsEmitted=%u recUs=%lld pipeSw=%u distinctPipe=%d savablePipe=%d scisSw=%u distinctScis=%d savableScis=%d riCollisions=%llu\n",
+                    bDraws, bRuns, (long long)batchTimer.elapsedMicroseconds(), bPipeSw, dPipe, (int)bPipeSw - dPipe,
+                    bScisSw, dScis, (int)bScisSw - dScis,
+                    (unsigned long long)s_ri_collisions.load(std::memory_order_relaxed));
+                std::fflush(stderr);
             }
         }
 
@@ -1543,9 +1648,12 @@ namespace RT64 {
         vertexInputSlots[0] = RenderInputSlot(0, PosStride);
         vertexInputSlots[1] = RenderInputSlot(1, TcStride);
         vertexInputSlots[2] = RenderInputSlot(2, ColStride);
+        vertexInputSlots[3] = RenderInputSlot(3, sizeof(uint32_t)); // per-vertex renderIndex
         indexedVertexViews[0] = RenderVertexBufferView(RenderBufferReference(screenPosRes), PosStride * vertexCount);
         indexedVertexViews[1] = RenderVertexBufferView(RenderBufferReference(tcRes), TcStride * vertexCount);
         indexedVertexViews[2] = RenderVertexBufferView(RenderBufferReference(shadedColRes), ColStride * vertexCount);
+        // indexedVertexViews[3] / rawVertexViews[3] are set in endFramebuffers, after
+        // renderIndexBuffer / rawRenderIndexBuffer are uploaded.
         indexBufferView = RenderIndexBufferView(RenderBufferReference(indexRes), IndexStride * indexCount, RenderFormat::R32_UINT);
         rawVertexViews[0] = RenderVertexBufferView(RenderBufferReference(triPosRes), PosStride * rawTriVertexCount);
         rawVertexViews[1] = RenderVertexBufferView(RenderBufferReference(triTcRes), TcStride * rawTriVertexCount);
@@ -1598,6 +1706,16 @@ namespace RT64 {
         const float aspectRatioScale = adjustRatio ? (p.aspectRatioTarget / p.aspectRatioSource) : 1.0f;
         InstanceDrawCall instanceDrawCall;
         interop::RenderIndices renderIndices;
+
+        // Per-vertex renderIndex stamp for draw-coalescing. Sized once per frame to
+        // the global vertex counts (members are cleared in resetFramebuffers; the
+        // first addFramebuffer of the frame grows them, later ones accumulate).
+        if (renderIndexData.size() != drawData.vertexCount()) {
+            renderIndexData.assign(drawData.vertexCount(), 0xFFFFFFFFu);
+        }
+        if (rawRenderIndexData.size() != drawData.rawTriVertexCount()) {
+            rawRenderIndexData.assign(drawData.rawTriVertexCount(), 0xFFFFFFFFu);
+        }
         uint32_t globalCallIndex = 0;
         const float wideWidth = p.fbWidth * p.resolutionScale.x;
         const float originalWidth = p.fbWidth * p.resolutionScale.y;
@@ -1853,6 +1971,32 @@ namespace RT64 {
 
                 // Determine to use the draw call either in the RT scene or the raster scene.
                 const uint32_t instanceIndex = static_cast<uint32_t>(instanceDrawCallVector.size());
+
+                {
+                    const uint32_t ri = instanceIndex; // == renderIndex the shader uses
+                    if (instanceDrawCall.type == InstanceDrawCall::Type::IndexedTriangles && !triangles.vertexTestZ) {
+                        const uint32_t start = triangles.indexStart;
+                        const uint32_t cnt = triangles.faceCount * 3;
+                        for (uint32_t k = 0; k < cnt; k++) {
+                            const uint32_t vid = drawData.faceIndices[start + k];
+                            if (vid < renderIndexData.size()) {
+                                if (renderIndexData[vid] != 0xFFFFFFFFu && renderIndexData[vid] != ri) {
+                                    s_ri_collisions.fetch_add(1, std::memory_order_relaxed);
+                                }
+                                renderIndexData[vid] = ri;
+                            }
+                        }
+                    }
+                    else if (instanceDrawCall.type == InstanceDrawCall::Type::RawTriangles ||
+                             instanceDrawCall.type == InstanceDrawCall::Type::RegularRect) {
+                        const uint32_t start = triangles.indexStart; // rawVertexStart for the raw path
+                        const uint32_t cnt = triangles.faceCount * 3;
+                        for (uint32_t k = 0; k < cnt; k++) {
+                            const uint32_t vid = start + k;
+                            if (vid < rawRenderIndexData.size()) rawRenderIndexData[vid] = ri;
+                        }
+                    }
+                }
 #           if RT_ENABLED
                 bool rtCall = instanceDrawCall.type == InstanceDrawCall::Type::Raytracing;
                 if (rtCall) {
@@ -1927,6 +2071,12 @@ namespace RT64 {
             { renderIndicesVector.data(), { 0, renderIndicesVector.size() }, sizeof(interop::RenderIndices), RenderBufferFlag::STORAGE, { }, &renderIndicesBuffer},
             { &frameParams, { 0, 1 }, sizeof(interop::FrameParams), RenderBufferFlag::CONSTANT, { }, &frameParamsBuffer}
         };
+        if (!renderIndexData.empty()) {
+            shaderUploads.push_back({ renderIndexData.data(), { 0, renderIndexData.size() }, sizeof(uint32_t), RenderBufferFlag::VERTEX, { }, &renderIndexBuffer });
+        }
+        if (!rawRenderIndexData.empty()) {
+            shaderUploads.push_back({ rawRenderIndexData.data(), { 0, rawRenderIndexData.size() }, sizeof(uint32_t), RenderBufferFlag::VERTEX, { }, &rawRenderIndexBuffer });
+        }
 
 #   if RT_ENABLED
         // FIXME: Add support for multiple raytracing scenes.
@@ -1978,6 +2128,15 @@ namespace RT64 {
 #   endif
 
         shaderUploader->submit(worker, shaderUploads);
+
+        // Slot-3 (per-vertex renderIndex) views, now that the buffers exist.
+        if (!renderIndexData.empty()) {
+            indexedVertexViews[3] = RenderVertexBufferView(RenderBufferReference(renderIndexBuffer.get()), uint32_t(sizeof(uint32_t) * renderIndexData.size()));
+        }
+        if (!rawRenderIndexData.empty()) {
+            rawVertexViews[3] = RenderVertexBufferView(RenderBufferReference(rawRenderIndexBuffer.get()), uint32_t(sizeof(uint32_t) * rawRenderIndexData.size()));
+        }
+
         updateShaderViews(worker, drawBuffers, outputBuffers, shaderViewRtEnabled);
     }
 
