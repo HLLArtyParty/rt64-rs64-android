@@ -756,7 +756,9 @@ namespace RT64 {
                     }
                 }
 
-                skipPresent = skipPresent || ext.swapChain->isEmpty();
+                // resize() can fail transiently while Android is replacing its
+                // native surface. Never render through released image views.
+                skipPresent = skipPresent || ext.swapChain->isEmpty() || !swapChainValid;
 
                 Present &present = presents[processCursor];
                 ext.workloadQueue->waitForWorkloadId(present.workloadId);
