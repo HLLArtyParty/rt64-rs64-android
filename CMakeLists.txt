@@ -35,19 +35,18 @@ function(preprocess INFILE OUTFILE OPTIONS)
     endif()
 endfunction()
 
-if (WIN32)
+if (CMAKE_HOST_WIN32)
     set (DXC "${PROJECT_SOURCE_DIR}/src/contrib/dxc/bin/x64/dxc.exe")
     add_compile_definitions(NOMINMAX)
 
     # Dependencies that must be next to the DLL.
     configure_file("${PROJECT_SOURCE_DIR}/src/contrib/dxc/bin/x64/dxcompiler.dll" "dxcompiler.dll" COPYONLY)
     configure_file("${PROJECT_SOURCE_DIR}/src/contrib/dxc/bin/x64/dxil.dll" "dxil.dll" COPYONLY)
-elseif (APPLE)
-    if (CMAKE_SYSTEM_PROCESSOR STREQUAL "x86_64")
-        # find zlib and include in dyld path
-        find_library(ZLIB_LIBRARY NAMES z)
-        get_filename_component(ZLIB_PATH ${ZLIB_LIBRARY} DIRECTORY)
-
+elseif (CMAKE_HOST_APPLE)
+    # Shader compilation is a host build step even while cross-compiling Android.
+    find_library(ZLIB_LIBRARY NAMES z)
+    get_filename_component(ZLIB_PATH ${ZLIB_LIBRARY} DIRECTORY)
+    if (CMAKE_HOST_SYSTEM_PROCESSOR STREQUAL "x86_64")
         set (DXC "DYLD_LIBRARY_PATH=${PROJECT_SOURCE_DIR}/src/contrib/dxc/lib/x64:${ZLIB_PATH}" "${PROJECT_SOURCE_DIR}/src/contrib/dxc/bin/x64/dxc-macos")
         set (SPIRVCROSS "DYLD_LIBRARY_PATH=${PROJECT_SOURCE_DIR}/src/contrib/spirv-cross/lib/x64:$ENV{DYLD_LIBRARY_PATH}" "${PROJECT_SOURCE_DIR}/src/contrib/spirv-cross/bin/x64/spirv-cross")
     else()
@@ -55,7 +54,7 @@ elseif (APPLE)
         set (SPIRVCROSS "DYLD_LIBRARY_PATH=${PROJECT_SOURCE_DIR}/src/contrib/spirv-cross/lib/arm64:$ENV{DYLD_LIBRARY_PATH}" "${PROJECT_SOURCE_DIR}/src/contrib/spirv-cross/bin/arm64/spirv-cross")
     endif()
 else()
-    if (CMAKE_SYSTEM_PROCESSOR STREQUAL "x86_64")
+    if (CMAKE_HOST_SYSTEM_PROCESSOR STREQUAL "x86_64" OR CMAKE_HOST_SYSTEM_PROCESSOR STREQUAL "AMD64")
         set (DXC "LD_LIBRARY_PATH=${PROJECT_SOURCE_DIR}/src/contrib/dxc/lib/x64" "${PROJECT_SOURCE_DIR}/src/contrib/dxc/bin/x64/dxc-linux")
     else()
         set (DXC "LD_LIBRARY_PATH=${PROJECT_SOURCE_DIR}/src/contrib/dxc/lib/arm64" "${PROJECT_SOURCE_DIR}/src/contrib/dxc/bin/arm64/dxc-linux")
@@ -65,10 +64,26 @@ endif()
 set(ZSTD_LEGACY_SUPPORT OFF)
 set(ZSTD_BUILD_STATIC ON)
 set(ZSTD_BUILD_SHARED OFF)
+if(ANDROID)
+    set(ZSTD_BUILD_DICTBUILDER OFF CACHE BOOL "" FORCE)
+    set(ZSTD_BUILD_PROGRAMS OFF CACHE BOOL "" FORCE)
+endif()
 
-add_subdirectory(src/tools/file_to_c)
+if(ANDROID)
+    if(NOT ZELDA_HOST_FILE_TO_C)
+        message(FATAL_ERROR "Android cross-compile requires -DZELDA_HOST_FILE_TO_C=/path/to/host/file_to_c")
+    endif()
+    set(FILE_TO_C "${ZELDA_HOST_FILE_TO_C}")
+    set(FILE_TO_C_DEP "${ZELDA_HOST_FILE_TO_C}")
+else()
+    add_subdirectory(src/tools/file_to_c)
+    set(FILE_TO_C file_to_c)
+    set(FILE_TO_C_DEP file_to_c)
+endif()
 add_subdirectory(src/contrib/re-spirv)
-add_subdirectory(src/contrib/nativefiledialog-extended)
+if (NOT TARGET nfd)
+    add_subdirectory(src/contrib/nativefiledialog-extended)
+endif()
 add_subdirectory(src/contrib/zstd/build/cmake)
 
 if (CMAKE_SYSTEM_NAME MATCHES "Linux" AND RT64_SDL_WINDOW_VULKAN)
@@ -115,8 +130,8 @@ function(build_shader_spirv_impl TARGETOBJ FILENAME TARGET_NAME OUTNAME)
         COMMAND ${DXC} ${DXC_SPV_OPTS} ${ARGN} ${FILENAME} /Fo ${OUTNAME}.spv
         DEPENDS ${FILENAME})
     add_custom_command(OUTPUT ${OUTNAME}.spirv.c
-        COMMAND file_to_c ${OUTNAME}.spv ${TARGET_NAME}BlobSPIRV ${OUTNAME}.spirv.c ${OUTNAME}.spirv.h
-        DEPENDS ${OUTNAME}.spv file_to_c
+        COMMAND ${FILE_TO_C} ${OUTNAME}.spv ${TARGET_NAME}BlobSPIRV ${OUTNAME}.spirv.c ${OUTNAME}.spirv.h
+        DEPENDS ${OUTNAME}.spv ${FILE_TO_C_DEP}
         BYPRODUCTS ${OUTNAME}.spirv.h)
     target_sources(${TARGETOBJ} PRIVATE ${OUTNAME}.spirv.c)
 endfunction()
@@ -126,8 +141,8 @@ function(build_shader_dxil_impl TARGETOBJ FILENAME TARGET_NAME OUTNAME)
         COMMAND ${DXC} ${DXC_DXIL_OPTS} ${ARGN} ${FILENAME} /Fo ${OUTNAME}.dxil
         DEPENDS ${FILENAME})
     add_custom_command(OUTPUT ${OUTNAME}.dxil.c
-        COMMAND file_to_c ${OUTNAME}.dxil ${TARGET_NAME}BlobDXIL ${OUTNAME}.dxil.c ${OUTNAME}.dxil.h
-        DEPENDS ${OUTNAME}.dxil file_to_c
+        COMMAND ${FILE_TO_C} ${OUTNAME}.dxil ${TARGET_NAME}BlobDXIL ${OUTNAME}.dxil.c ${OUTNAME}.dxil.h
+        DEPENDS ${OUTNAME}.dxil ${FILE_TO_C_DEP}
         BYPRODUCTS ${OUTNAME}.dxil.h)
     target_sources(${TARGETOBJ} PRIVATE ${OUTNAME}.dxil.c)
 endfunction()
@@ -146,8 +161,8 @@ function(build_shader_msl_impl TARGETOBJ FILENAME TARGET_NAME OUTNAME)
             COMMAND xcrun -sdk macosx metallib ${OUTNAME}.ir -o ${OUTNAME}.metallib
             DEPENDS ${OUTNAME}.ir)
     add_custom_command(OUTPUT ${OUTNAME}.metal.c
-            COMMAND file_to_c ${OUTNAME}.metallib ${TARGET_NAME}BlobMSL ${OUTNAME}.metal.c ${OUTNAME}.metal.h
-            DEPENDS ${OUTNAME}.metallib file_to_c
+            COMMAND ${FILE_TO_C} ${OUTNAME}.metallib ${TARGET_NAME}BlobMSL ${OUTNAME}.metal.c ${OUTNAME}.metal.h
+            DEPENDS ${OUTNAME}.metallib ${FILE_TO_C_DEP}
             BYPRODUCTS ${OUTNAME}.metal.h)
     target_sources(${TARGETOBJ} PRIVATE ${OUTNAME}.metal.c)
 endfunction()
@@ -240,8 +255,8 @@ function(preprocess_shader TARGETOBJ SHADERNAME)
     cmake_path(GET OUTNAME PARENT_PATH OUTPUT_DIR)
     preprocess(${FILENAME} ${OUTNAME}.rw ${DXC_COMMON_OPTS})
     add_custom_command(OUTPUT ${OUTNAME}.rw.c
-        COMMAND file_to_c ${OUTNAME}.rw ${TARGET_NAME}Text ${OUTNAME}.rw.c ${OUTNAME}.rw.h
-        DEPENDS ${OUTNAME}.rw file_to_c
+        COMMAND ${FILE_TO_C} ${OUTNAME}.rw ${TARGET_NAME}Text ${OUTNAME}.rw.c ${OUTNAME}.rw.h
+        DEPENDS ${OUTNAME}.rw ${FILE_TO_C_DEP}
         BYPRODUCTS ${OUTNAME}.rw.h)
     file(MAKE_DIRECTORY ${OUTPUT_DIR})
     target_sources(${TARGETOBJ} PRIVATE ${OUTNAME}.rw.c)
