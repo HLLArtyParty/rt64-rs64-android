@@ -23,6 +23,10 @@
 #include "rt64_descriptor_sets.h"
 #include "rt64_render_worker.h"
 
+#if defined(__ANDROID__)
+extern "C" std::atomic<uint32_t> g_rs64_interactive_projection_address;
+#endif
+
 // TODO: Move to shared.
 
 namespace interop {
@@ -1766,10 +1770,47 @@ namespace RT64 {
             if (proj.usesViewport()) {
                 // The call's scissor spans the whole width of the framebuffer pair scissor. Custom origin must not be in use to be able to use the stretched viewport.
                 const auto &viewport = drawData.rspViewports[proj.transformsIndex];
-                FixedRect intersectionRect = proj.scissorRect.intersection(viewport.rect(viewportClipRatios));
+                const FixedRect viewportRect = viewport.rect(viewportClipRatios);
+                FixedRect intersectionRect = proj.scissorRect.intersection(viewportRect);
                 bool coversWholeWidth = !intersectionRect.isEmpty() && (intersectionRect.ulx <= fbPair.scissorRect.ulx) && (intersectionRect.lrx >= fbPair.scissorRect.lrx);
                 bool horizontalRatio = !intersectionRect.isEmpty() && (intersectionRect.width(true, true) > intersectionRect.height(true, true));
+                bool interactiveProjection = false;
+#if defined(__ANDROID__)
+                const char *displayMode = std::getenv("ROGUESQ_DISPLAY_MODE");
+                if (displayMode && (std::strcmp(displayMode, "horplus") == 0)) {
+                    const uint32_t interactiveAddress = g_rs64_interactive_projection_address.load(std::memory_order_relaxed);
+                    const auto addressRange = p.curWorkload->physicalAddressTransformMap.equal_range(interactiveAddress);
+                    for (auto it = addressRange.first; it != addressRange.second; it++) {
+                        if (it->second == proj.transformsIndex) {
+                            interactiveProjection = true;
+                            break;
+                        }
+                    }
+                }
+#endif
                 bool useWideViewport = (viewportOrigin == G_EX_ORIGIN_NONE) && coversWholeWidth && horizontalRatio;
+#if defined(__ANDROID__)
+                if (interactiveProjection) {
+                    static std::atomic<uint32_t> widescreenProbeCount{0};
+                    const uint32_t probeIndex = widescreenProbeCount.fetch_add(1, std::memory_order_relaxed);
+                    if (probeIndex < 32) {
+                        std::fprintf(stderr,
+                            "[widescreen-probe] projection=0x%06X fbPair=%u proj=%u transform=%u "
+                            "fbScissor=(%d,%d)-(%d,%d) projScissor=(%d,%d)-(%d,%d) "
+                            "viewport=(%d,%d)-(%d,%d) intersection=(%d,%d)-(%d,%d) "
+                            "coversWholeWidth=%d horizontalRatio=%d viewportOrigin=%u useWideViewport=%d\n",
+                            g_rs64_interactive_projection_address.load(std::memory_order_relaxed),
+                            p.fbPairIndex, pr, proj.transformsIndex,
+                            int(fbPair.scissorRect.ulx), int(fbPair.scissorRect.uly), int(fbPair.scissorRect.lrx), int(fbPair.scissorRect.lry),
+                            int(proj.scissorRect.ulx), int(proj.scissorRect.uly), int(proj.scissorRect.lrx), int(proj.scissorRect.lry),
+                            int(viewportRect.ulx), int(viewportRect.uly), int(viewportRect.lrx), int(viewportRect.lry),
+                            int(intersectionRect.ulx), int(intersectionRect.uly), int(intersectionRect.lrx), int(intersectionRect.lry),
+                            coversWholeWidth ? 1 : 0, horizontalRatio ? 1 : 0,
+                            unsigned(viewportOrigin), useWideViewport ? 1 : 0);
+                        std::fflush(stderr);
+                    }
+                }
+#endif
                 if (useWideViewport) {
                     projInvRatioScale = 1.0f;
                 }
