@@ -4,18 +4,11 @@
 
 #include "rt64_workload_queue.h"
 
-#include <cstdlib>
-#include <string_view>
-
 #include "common/rt64_thread.h"
 
 #include "rt64_present_queue.h"
 
 #define ENABLE_HIGH_RESOLUTION_RENDERER 1
-
-#if defined(__ANDROID__)
-extern "C" volatile int g_active_overlay;
-#endif
 
 namespace RT64 {
     // WorkloadQueue
@@ -139,15 +132,6 @@ namespace RT64 {
 
         // Compute the aspect ratio to be used for the frame.
         workloadConfig.aspectRatioSource = (viFbSize[1] > 0) ? float(viFbSize[0]) / float(viFbSize[1]) : (4.0f / 3.0f);
-#if defined(__ANDROID__)
-        const char *displayMode = std::getenv("ROGUESQ_DISPLAY_MODE");
-        if ((g_active_overlay == 0) && displayMode && (std::string_view(displayMode) == "horplus")) {
-            // Rogue's mission VI modes use non-square pixels. Experimental Hor+
-            // treats their authored source as 4:3 before targeting 16:9.
-            workloadConfig.aspectRatioSource = 4.0f / 3.0f;
-        }
-#endif
-
         const auto ratioMode = ext.sharedResources->userConfig.aspectRatio;
         switch (ratioMode) {
         case UserConfiguration::AspectRatio::Expand:
