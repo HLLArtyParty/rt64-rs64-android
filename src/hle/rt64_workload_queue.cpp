@@ -10,6 +10,10 @@
 
 #define ENABLE_HIGH_RESOLUTION_RENDERER 1
 
+// Rogue Squadron missions use non-square-pixel VI modes. Their framebuffer
+// dimensions are not the displayed aspect; the authored source image is 4:3.
+extern "C" volatile int g_active_overlay;
+
 namespace RT64 {
     // WorkloadQueue
 
@@ -132,6 +136,9 @@ namespace RT64 {
 
         // Compute the aspect ratio to be used for the frame.
         workloadConfig.aspectRatioSource = (viFbSize[1] > 0) ? float(viFbSize[0]) / float(viFbSize[1]) : (4.0f / 3.0f);
+        if (g_active_overlay == 0) {
+            workloadConfig.aspectRatioSource = 4.0f / 3.0f;
+        }
 
         const auto ratioMode = ext.sharedResources->userConfig.aspectRatio;
         switch (ratioMode) {
