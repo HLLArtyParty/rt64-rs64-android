@@ -7,6 +7,7 @@
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
+#include <string_view>
 
 #include "common/rt64_thread.h"
 #include "rhi/rt64_render_hooks.h"
@@ -597,7 +598,9 @@ namespace RT64 {
                     // native VI region, leaving the final cinematic image alive in
                     // those sides. Mask only the swapchain area outside the mission's
                     // native presentation; never clear or resize game-owned targets.
-                    if (g_active_overlay == 0) {
+                    const char *displayMode = std::getenv("ROGUESQ_DISPLAY_MODE");
+                    if ((g_active_overlay == 0) &&
+                        (!displayMode || (std::string_view(displayMode) != "horplus"))) {
                         VIRenderer::RenderParams missionPresentation = renderParams;
                         missionPresentation.resolutionScale.x = missionPresentation.resolutionScale.y;
 
