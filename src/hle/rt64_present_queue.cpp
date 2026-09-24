@@ -13,6 +13,10 @@
 
 #include "rt64_workload_queue.h"
 
+#if defined(__ANDROID__)
+extern "C" volatile int g_active_overlay;
+#endif
+
 // Most draw-active color buffer, published by the F3DFACTOR5 GBI module. Present
 // mode 4 presents it so offscreen-rendered content (e.g. the cinematic explosion
 // in 0x290000) reaches the screen.
@@ -586,6 +590,45 @@ namespace RT64 {
                 if (renderParams.texture != nullptr) {
                     commandList->barriers(RenderBarrierStage::GRAPHICS, RenderTextureBarrier(renderParams.texture, RenderTextureLayout::SHADER_READ));
                     viRenderer->render(renderParams);
+
+#if defined(__ANDROID__)
+                    // A cinematic can populate the expanded sides of RT64's pooled
+                    // color target. Mission frames then update only their narrower
+                    // native VI region, leaving the final cinematic image alive in
+                    // those sides. Mask only the swapchain area outside the mission's
+                    // native presentation; never clear or resize game-owned targets.
+                    if (g_active_overlay == 0) {
+                        VIRenderer::RenderParams missionPresentation = renderParams;
+                        missionPresentation.resolutionScale.x = missionPresentation.resolutionScale.y;
+
+                        RenderViewport missionViewport;
+                        RenderRect missionScissor;
+                        VIRenderer::getViewportAndScissor(
+                            missionPresentation.swapChain,
+                            *missionPresentation.vi,
+                            missionPresentation.resolutionScale,
+                            missionPresentation.downsamplingScale,
+                            missionPresentation.removeBlackBorders,
+                            missionViewport,
+                            missionScissor);
+
+                        const int32_t outputWidth = static_cast<int32_t>(ext.swapChain->getWidth());
+                        const int32_t outputHeight = static_cast<int32_t>(ext.swapChain->getHeight());
+                        const int32_t contentLeft = std::clamp(missionScissor.left, 0, outputWidth);
+                        const int32_t contentRight = std::clamp(missionScissor.right, 0, outputWidth);
+                        RenderRect missionSideBars[2];
+                        uint32_t missionSideBarCount = 0;
+                        if (contentLeft > 0) {
+                            missionSideBars[missionSideBarCount++] = RenderRect(0, 0, contentLeft, outputHeight);
+                        }
+                        if (contentRight < outputWidth) {
+                            missionSideBars[missionSideBarCount++] = RenderRect(contentRight, 0, outputWidth, outputHeight);
+                        }
+                        if (missionSideBarCount > 0) {
+                            commandList->clearColor(0, RenderColor(), missionSideBars, missionSideBarCount);
+                        }
+                    }
+#endif
                 }
 
                 RenderHookDraw *drawHook = GetRenderHookDraw();
