@@ -1790,6 +1790,11 @@ namespace RT64 {
 #endif
                 bool useWideViewport = (viewportOrigin == G_EX_ORIGIN_NONE) && coversWholeWidth && horizontalRatio;
 #if defined(__ANDROID__)
+                // The game leaves the interactive projection one native pixel short
+                // of the framebuffer-pair scissor. The exact projection address is
+                // published by the positively identified player-camera wrapper, so
+                // widen only that projection instead of weakening RT64 globally.
+                useWideViewport = useWideViewport || interactiveProjection;
                 if (interactiveProjection) {
                     static std::atomic<uint32_t> widescreenProbeCount{0};
                     const uint32_t probeIndex = widescreenProbeCount.fetch_add(1, std::memory_order_relaxed);
